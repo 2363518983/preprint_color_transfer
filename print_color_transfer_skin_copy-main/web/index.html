@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>印刷调色 · 批量处理与审核</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#upload"><span class="brand-mark">C</span><span>Chromawork</span></a>
+    <nav>
+      <a href="#upload" data-nav="upload">批量处理</a>
+      <a href="#review" data-nav="review">审核工作台</a>
+    </nav>
+    <div class="profile-chip"><span class="status-dot"></span><span id="profileName">模型就绪</span></div>
+  </header>
+
+  <main>
+    <!-- 批量处理视图 -->
+    <section id="uploadView" class="view">
+      <div class="hero">
+        <p class="eyebrow">RGB → PRINT CMYK</p>
+        <h1>把一批图片，变成<br><em>一致的印刷色彩。</em></h1>
+        <p class="hero-copy">使用已训练的 Japan Color 调色模型批量处理，支持多页 PDF，保留原始结构与文件格式，并在交付前逐张审核。</p>
+      </div>
+
+      <div class="upload-grid">
+        <section class="panel upload-panel">
+          <div class="panel-heading">
+            <div><span class="step">01</span><h2>创建处理批次</h2></div>
+            <span class="hint">JPG · PNG · TIFF · PDF</span>
+          </div>
+          <label class="field-label" for="batchName">批次名称</label>
+          <input id="batchName" class="text-input" placeholder="例如：八月产品画册">
+          <div id="dropzone" class="dropzone" tabindex="0">
+            <input id="fileInput" type="file" accept="image/jpeg,image/png,image/tiff,application/pdf,.pdf" multiple hidden>
+            <div class="drop-icon">↥</div>
+            <strong>拖入图片或 PDF，或点击选择</strong>
+            <span id="uploadHint">可一次选择多张，单张不超过 512 MB</span>
+            <label style="margin-top:12px;display:flex;align-items:center;gap:8px;font-size:13px;color:#3f4a42;">
+              <input type="checkbox" id="hasTarget" checked> 同时上传目标图（同名匹配，用于指标计算）
+            </label>
+          </div>
+          <div id="selection" class="selection hidden"></div>
+          <button id="startButton" class="button primary" disabled>开始批量处理 <span>→</span></button>
+        </section>
+
+        <aside class="panel process-panel">
+          <div class="panel-heading"><div><span class="step">02</span><h2>处理队列</h2></div></div>
+          <div id="emptyQueue" class="empty-state">
+            <span>◌</span><p>选择图片后，处理进度会显示在这里</p>
+          </div>
+          <div id="queue" class="queue hidden"></div>
+          <button id="reviewButton" class="button secondary hidden">进入审核工作台</button>
+        </aside>
+      </div>
+
+      <section class="recent-section">
+        <div class="section-title"><div><p class="eyebrow">RECENT BATCHES</p><h2>最近批次</h2></div><button id="refreshBatches" class="text-button">刷新</button></div>
+        <div id="batchList" class="batch-list"></div>
+      </section>
+    </section>
+
+    <!-- 审核工作台视图 -->
+    <section id="reviewView" class="view hidden">
+      <div class="review-header">
+        <div><button class="back-link" id="backButton">← 返回批量处理</button><p class="eyebrow">QUALITY CONTROL</p><h1 id="reviewTitle">审核工作台</h1><p id="reviewMeta" class="muted"></p></div>
+        <div class="review-actions">
+          <select id="statusFilter" class="select"><option value="all">全部图片</option><option value="pending">待审核</option><option value="approved">已通过</option><option value="rejected">已驳回</option></select>
+          <button id="curveButton" class="button secondary compact" type="button">CMYK 曲线调整</button>
+          <a id="downloadButton" class="button primary compact" href="#">下载已通过结果</a>
+          <button id="deleteBatchButton" class="button danger compact" type="button">删除批次</button>
+        </div>
+      </div>
+      <div id="stats" class="stats"></div>
+      <div class="review-workspace">
+        <aside class="file-panel">
+          <div class="file-panel-head">
+            <span>文件列表</span><span id="fileCount" class="muted"></span>
+          </div>
+          <div id="fileList" class="file-list"></div>
+          <div id="noReview" class="file-empty hidden">当前筛选下没有文件</div>
+        </aside>
+        <section class="viewer-panel">
+          <div id="viewerEmpty" class="viewer-empty"><span>◨</span><p>在左侧选择一个文件，这里显示大图对比</p></div>
+          <article id="viewer" class="viewer hidden"></article>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <!-- CMYK 曲线批量调整面板 -->
+  <div id="curveModal" class="modal hidden">
+    <div class="modal-card">
+      <header class="modal-head">
+        <div><p class="eyebrow">CURVES</p><h2>CMYK 曲线批量调整</h2></div>
+        <button id="curveClose" class="icon-button" type="button" aria-label="关闭">×</button>
+      </header>
+      <div class="curve-body">
+        <section class="curve-editor">
+          <div class="channel-tabs">
+            <button class="chan-tab active" type="button" data-chan="master">CMYK 全通道</button>
+            <button class="chan-tab" type="button" data-chan="C">C 青</button>
+            <button class="chan-tab" type="button" data-chan="M">M 洋红</button>
+            <button class="chan-tab" type="button" data-chan="Y">Y 黄</button>
+            <button class="chan-tab" type="button" data-chan="K">K 黑</button>
+          </div>
+          <canvas id="curveCanvas" width="320" height="320"></canvas>
+          <div class="curve-readout"><span id="curveReadout">输入 — → 输出 —</span></div>
+          <p class="curve-hint">曲线越向上油墨越重。空白处点击加点，拖动调整；把点拖出图外、按 Delete，或点「删除选中点」可丢掉控制点。两端黑白场不能删。</p>
+          <div class="curve-buttons">
+            <button id="curveDeletePoint" class="text-button" type="button" disabled>删除选中点</button>
+            <button id="curveResetChan" class="text-button" type="button">重置当前通道</button>
+            <button id="curveResetAll" class="text-button" type="button">全部重置</button>
+          </div>
+        </section>
+        <aside class="curve-side">
+          <label class="field-label" for="curveImage">预览文件</label>
+          <select id="curveImage" class="select"></select>
+          <select id="curvePage" class="select hidden"></select>
+          <div class="curve-preview"><img id="curvePreview" alt="CMYK 软打样预览"></div>
+          <p class="muted" id="curveStatus">预览为交付文件软打样（PSOcoated_v3）</p>
+        </aside>
+      </div>
+      <footer class="modal-foot">
+        <span class="muted" id="curveFootHint">曲线写进交付的 CMYK 文件。分层写入失败时，用整页 TIFF 重组。</span>
+        <div class="modal-actions">
+          <button id="curveCancel" class="button secondary compact" type="button">取消</button>
+          <button id="curveApply" class="button primary compact" type="button">应用到整批</button>
+        </div>
+      </footer>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

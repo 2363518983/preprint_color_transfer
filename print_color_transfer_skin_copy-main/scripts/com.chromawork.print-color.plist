@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.chromawork.print-color</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/zsh</string>
+		<string>/Users/chenshaoqiong/projects/print_color_transfer_predict_curvedeltae3.098/scripts/start_app.sh</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/chenshaoqiong/projects/print_color_transfer_predict_curvedeltae3.098</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/Users/chenshaoqiong/projects/print_color_transfer_predict_curvedeltae3.098/logs/app.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/chenshaoqiong/projects/print_color_transfer_predict_curvedeltae3.098/logs/app.err.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PYTHONUNBUFFERED</key>
+		<string>1</string>
+	</dict>
+</dict>
+</plist>
