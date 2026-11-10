@@ -1734,7 +1734,7 @@ def save_processed_image(pred_pil, path, as_cmyk=True):
     return path
 
 
-def _pil_to_bytes(pil_img, fmt="JPEG", quality=95):
+def pil_to_bytes(pil_img, fmt="JPEG", quality=95):
     buf = io.BytesIO()
     fmt_upper = fmt.upper()
     if fmt_upper == "JPEG":
@@ -1978,7 +1978,7 @@ def process_image_pair(image_path, target_path=None, model=None,
             cmyk = _to_cmyk_pil(pred_pil)
             name = cmyk_container_name(output_filename or Path(image_path).name)
             fmt = format_from_suffix(Path(name).suffix)
-            raw, mime = _pil_to_bytes(cmyk, fmt=fmt)
+            raw, mime = pil_to_bytes(cmyk, fmt=fmt)
             return {"rgb": {"bytes": raw, "mime": mime, "filename": name}}
         finally:
             pred_pil.close()
