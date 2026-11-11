@@ -1,0 +1,9 @@
+torch
+numpy
+pillow
+scikit-image
+pypdfium2
+pypdf
+tqdm
+opencv-python
+mediapipe

@@ -48,7 +48,7 @@ def _fit_global_curve_if_missing(cfg, data_dir=None):
     icc = "utils/PSOcoated_v3.icc"
     icc = icc if os.path.exists(icc) else None
     if icc:
-        from icc_color import init_icc
+        from utils.icc_color import init_icc
         init_icc(icc)
     pairs = discover_pairs(data_dir)
     if len(pairs) == 0:

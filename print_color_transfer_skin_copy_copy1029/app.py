@@ -4,30 +4,29 @@
 模型：CurvePredictor（v3，checkpoints/curve_pred_best.pth）
 输出：RGB 预览 + CMYK 印刷稿（PSOcoated_v3.icc）
 """
-import argparse, io, json, mimetypes, os, shutil, threading, time, uuid, zipfile, traceback
+import argparse, json, mimetypes, os, shutil, threading, uuid, zipfile, traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-import numpy as np
 from PIL import Image
 
-from processor import (process_file, load_model, read_image,
+from processor import (process_file, load_model,
                        apply_cmyk_curves, cmyk_to_srgb, curves_are_identity,
                        normalize_curves, save_cmyk_image, save_cmyk_pdf,
                        apply_cmyk_curves_to_pdf,
                        cmyk_container_name, is_pdf, pdf_page_count,
-                       load_first_page_rgb, _pil_to_bytes)
+                       load_first_page_rgb, pil_to_bytes)
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".pdf"}
-DEFAULT_MODEL = "checkpoints/curve_pred_best.pth"         # ★ v3 模型
+DEFAULT_MODEL = "checkpoints/curve_pred_best.pth"
 PROOF_SIZE = 1400          # 软打样底图边长，用于曲线面板实时预览
 PREVIEW_SIZE = 1600
-BATCH_DIRS = ("input", "input_preview", "output", "pages", "adjusted", "proof",
+BATCH_DIRS = ("input", "input_preview", "output", "pages", "stages", "adjusted", "proof",
               "preview", "target", "target_preview")
+DEFAULT_GAINS = {"curve": 1.2, "skin": 1.2, "residual": 1.0}
 
 
 def utc_now(): return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -66,13 +65,10 @@ def unique_zip_name(filename, image_id, used):
     return f"{stem}_{image_id}{suffix}"
 
 
-safe_filename = original_filename
-
-
 class AppState:
     def __init__(self, model_path, data_dir, workers=2, max_upload_mb=512,
                  inference_size=512, pdf_dpi=300):
-        self.model = load_model(model_path)               # ★ CurvePredictor
+        self.model = load_model(model_path)
         self.model_path = Path(model_path)
         self.data_dir = Path(data_dir)
         self.max_upload_mb = max_upload_mb
@@ -84,7 +80,6 @@ class AppState:
         self.infer_lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="colour")
 
-    # ---- batch / manifest 逻辑：原样保留 ----
     def batch_dir(self, batch_id):
         if not batch_id.replace("-", "").isalnum():
             raise ValueError("非法批次 ID")
@@ -116,6 +111,7 @@ class AppState:
             "created_at": utc_now(), "updated_at": utc_now(),
             "model": self.model_path.name,
             "target_profile": "CMYK",
+            "gains": dict(DEFAULT_GAINS),
             "curves": normalize_curves(None),
             "curves_status": "idle",
             "images": [],
@@ -199,7 +195,6 @@ class AppState:
             self.write_batch(batch)
             return item.copy()
 
-    # ★★★ 核心：推理调用（曲线版）★★★
     def process_image(self, batch_id, image_id):
         item = self.update_item(batch_id, image_id, process_status="processing", error=None)
         root = self.batch_dir(batch_id)
@@ -210,6 +205,7 @@ class AppState:
                 target_path = root / "target" / item["target_file"]
 
             output_name = stored_name_with_suffix(image_id, item["filename"])
+            gains = (self.read_batch(batch_id).get("gains") or dict(DEFAULT_GAINS))
             with self.infer_lock:
                 result = process_file(
                     image_path=str(input_path),
@@ -221,10 +217,12 @@ class AppState:
                     proof_dir=str(root / "proof"),
                     input_preview_dir=str(root / "input_preview"),
                     page_dir=str(root / "pages"),
+                    stage_dir=str(root / "stages"),
                     page_stem=image_id,
                     proof_size=PROOF_SIZE,
                     input_preview_size=PREVIEW_SIZE,
                     pdf_dpi=self.pdf_dpi,
+                    gains=gains,
                 )
 
             out_path = Path(result["output_path"])
@@ -289,9 +287,18 @@ class AppState:
             adjusted_name = item["output_file"]
             target = adjusted_dir / adjusted_name
             base_pages = [p.get("base_page_file") for p in pages if p.get("base_page_file")]
-            if is_pdf(base_path) or is_pdf(item.get("filename", "")):
-                apply_cmyk_curves_to_pdf(str(base_path), str(target), curves)
-            elif base_pages:                      # 旧批次：逐页 TIFF 重组
+            pdfish = is_pdf(base_path) or is_pdf(item.get("filename", ""))
+            layered_ok = False
+            if pdfish:
+                try:
+                    apply_cmyk_curves_to_pdf(str(base_path), str(target), curves)
+                    layered_ok = True
+                except Exception:
+                    traceback.print_exc()
+                    print("   分层套曲线失败，改用整页 TIFF 重组")
+            if layered_ok:
+                pass
+            elif base_pages:                      # 旧批次或超大 PDF 回退：逐页 TIFF 重组
                 tmp_dir = adjusted_dir / f".{image_id}_pages"
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -315,7 +322,7 @@ class AppState:
                     img.load()
                     save_cmyk_image(apply_cmyk_curves(img, curves), target)
 
-        # 2) 逐页软打样预览（sRGB JPEG，网页对比用）
+        # 2) 网页预览：软打样底图来自分层成功后重新栅格化的交付 PDF
         preview_dir = root / "preview"
         preview_dir.mkdir(parents=True, exist_ok=True)
         updated_pages = []
@@ -369,10 +376,11 @@ class AppState:
                 try:
                     batch = self.read_batch(batch_id)
                 except FileNotFoundError:
-                    return
-                batch["curves_status"] = "idle"
-                batch["updated_at"] = utc_now()
-                self.write_batch(batch)
+                    batch = None
+                if batch is not None:
+                    batch["curves_status"] = "idle"
+                    batch["updated_at"] = utc_now()
+                    self.write_batch(batch)
 
     def curve_preview(self, batch_id, image_id, curves, size=900, page=0):
         """把曲线套在指定页的软打样底图上，返回可直接显示的 JPEG。"""
@@ -396,7 +404,7 @@ class AppState:
             img.load()
             proofed = cmyk_to_srgb(apply_cmyk_curves(img, curves))
         proofed.thumbnail((size, size), Image.Resampling.LANCZOS)
-        raw, mime = _pil_to_bytes(proofed, fmt="JPEG", quality=88)
+        raw, mime = pil_to_bytes(proofed, fmt="JPEG", quality=88)
         return raw, mime, item["id"]
 
     def delivery_path(self, batch_id, item):
@@ -557,7 +565,6 @@ class Handler(BaseHTTPRequestHandler):
             elif len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "download":
                 status = parse_qs(parsed.query).get("status", ["approved"])[0]
                 self.send_file(self.app.make_zip(parts[2], status), f"{parts[2]}_{status}.zip")
-            # ★★★ 新增：单张图片下载端点 ★★★
             elif len(parts) == 5 and parts[:2] == ["api", "batches"] and parts[4] == "download":
                 batch_id, image_id = parts[2], parts[3]
                 fmt = parse_qs(parsed.query).get("format", ["original"])[0]
@@ -705,7 +712,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser(description="印刷调色 Web 服务（CurvePredictor v3）")
-    ap.add_argument("--model", default="checkpoints/curve_pred_best.pth", help="CurvePredictor 权重路径")   # ★ 默认改了
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="CurvePredictor 权重路径")
     ap.add_argument("--data", default="web_data", help="数据存储目录")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=5001)
