@@ -1,7 +1,4 @@
 web_data/
-mask_cache/
-.merge_upstream_src/
-selfie_segmenter.tflite
 __pycache__/
 *.pyc
 .DS_Store

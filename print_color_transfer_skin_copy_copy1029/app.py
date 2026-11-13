@@ -2,26 +2,32 @@
 """
 印刷调色 Web 服务（基于 http.server + 线程池）
 模型：CurvePredictor（v3，checkpoints/curve_pred_best.pth）
-输出：RGB 预览 + CMYK 印刷稿（PSOcoated_v3.icc）
+输出：RGB 预览 + CMYK 印刷稿（按批次选择 CMYK ICC，默认 PSOcoated_v3.icc）
 """
-import argparse, json, mimetypes, os, shutil, threading, uuid, zipfile, traceback
+import argparse, hashlib, io, json, mimetypes, os, shutil, threading, time, uuid, zipfile, traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+import numpy as np
 from PIL import Image
 
-from processor import (process_file, load_model,
+from processor import (process_file, load_model, read_image,
                        apply_cmyk_curves, cmyk_to_srgb, curves_are_identity,
                        normalize_curves, save_cmyk_image, save_cmyk_pdf,
                        apply_cmyk_curves_to_pdf,
                        cmyk_container_name, is_pdf, pdf_page_count,
-                       load_first_page_rgb, pil_to_bytes)
+                       load_first_page_rgb, _pil_to_bytes,
+                       ICC_DIR, DEFAULT_CMYK_ICC, load_icc_transforms, use_cmyk_icc)
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".pdf"}
-DEFAULT_MODEL = "checkpoints/curve_pred_best.pth"
+ICC_EXTENSIONS = {".icc", ".icm"}
+MAX_ICC_BYTES = 32 * 1024 * 1024
+DEFAULT_ICC = Path(DEFAULT_CMYK_ICC).name
+DEFAULT_MODEL = "checkpoints/curve_pred_best.pth"         # ★ v3 模型
 PROOF_SIZE = 1400          # 软打样底图边长，用于曲线面板实时预览
 PREVIEW_SIZE = 1600
 BATCH_DIRS = ("input", "input_preview", "output", "pages", "stages", "adjusted", "proof",
@@ -65,10 +71,28 @@ def unique_zip_name(filename, image_id, used):
     return f"{stem}_{image_id}{suffix}"
 
 
+safe_filename = original_filename
+
+
+def icc_filename(name):
+    """ICC 以文件名作为 ID：只保留文件名本身，限定 .icc/.icm 后缀。"""
+    name = Path(unquote(name or "")).name.strip().replace("\x00", "")
+    name = name.replace("/", "").replace("\\", "")
+    if not name or name in {".", ".."} or name.startswith("."):
+        raise ValueError("非法 ICC 文件名")
+    if Path(name).suffix.lower() not in ICC_EXTENSIONS:
+        raise ValueError("仅支持 .icc / .icm 格式的 ICC 文件")
+    return name[:120]
+
+
+def icc_label(icc_id):
+    return Path(icc_id or DEFAULT_ICC).stem
+
+
 class AppState:
     def __init__(self, model_path, data_dir, workers=2, max_upload_mb=512,
                  inference_size=512, pdf_dpi=300):
-        self.model = load_model(model_path)
+        self.model = load_model(model_path)               # ★ CurvePredictor
         self.model_path = Path(model_path)
         self.data_dir = Path(data_dir)
         self.max_upload_mb = max_upload_mb
@@ -76,10 +100,82 @@ class AppState:
         self.inference_size = inference_size              # 曲线忽略，仅兼容
         self.pdf_dpi = pdf_dpi
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.builtin_icc_dir = Path(ICC_DIR)
+        self.icc_dir = self.data_dir / "icc_profiles"          # 用户上传的 ICC
+        self.icc_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.infer_lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="colour")
 
+    # ---- CMYK ICC 库：utils/ 内置 + 用户上传 ----
+    @staticmethod
+    def _icc_files(folder):
+        if not folder.is_dir():
+            return []
+        return sorted((p for p in folder.iterdir()
+                       if p.is_file() and p.suffix.lower() in ICC_EXTENSIONS),
+                      key=lambda p: p.name.lower())
+
+    def icc_path(self, icc_id):
+        name = icc_filename(icc_id or DEFAULT_ICC)
+        for folder in (self.builtin_icc_dir, self.icc_dir):
+            path = folder / name
+            if path.is_file():
+                return path
+        raise ValueError(f"ICC 不存在：{name}")
+
+    def icc_profiles(self):
+        rows = []
+        for builtin, folder in ((True, self.builtin_icc_dir), (False, self.icc_dir)):
+            for path in self._icc_files(folder):
+                if not builtin and (self.builtin_icc_dir / path.name).is_file():
+                    continue
+                try:
+                    description = load_icc_transforms(str(path)).description
+                except Exception as exc:
+                    print(f"[ICC] 跳过无效 ICC {path}: {exc}")
+                    continue
+                rows.append({"id": path.name, "name": icc_label(path.name),
+                             "description": description, "builtin": builtin,
+                             "default": path.name == DEFAULT_ICC})
+        return rows
+
+    def add_icc_profile(self, filename, uploaded_path):
+        """保存上传的 CMYK ICC；同名不同内容时自动加序号，同内容直接复用。"""
+        name = icc_filename(filename)
+        digest = hashlib.md5(uploaded_path.read_bytes()).hexdigest()
+        stem, suffix = Path(name).stem, Path(name).suffix
+        candidate, n = name, 1
+        while True:
+            existing = next((f / candidate for f in (self.builtin_icc_dir, self.icc_dir)
+                             if (f / candidate).is_file()), None)
+            if existing is None:
+                break
+            if hashlib.md5(existing.read_bytes()).hexdigest() == digest:
+                return next(p for p in self.icc_profiles() if p["id"] == candidate)
+            n += 1
+            candidate = f"{stem}_{n}{suffix}"
+        final_path = self.icc_dir / candidate
+        uploaded_path.replace(final_path)
+        try:
+            transforms = load_icc_transforms(str(final_path))
+        except Exception as exc:
+            final_path.unlink(missing_ok=True)
+            raise ValueError(f"ICC 无效：{exc}")
+        return {"id": candidate, "name": icc_label(candidate),
+                "description": transforms.description, "builtin": False, "default": False}
+
+    def batch_icc_path(self, batch):
+        return self.icc_path(batch.get("cmyk_icc") or DEFAULT_ICC)
+
+    @staticmethod
+    def with_icc_fields(batch):
+        icc_id = batch.get("cmyk_icc") or DEFAULT_ICC
+        batch["cmyk_icc"] = icc_id
+        batch["target_profile"] = icc_label(icc_id)
+        return batch
+
+    # ---- batch / manifest 逻辑：原样保留 ----
     def batch_dir(self, batch_id):
         if not batch_id.replace("-", "").isalnum():
             raise ValueError("非法批次 ID")
@@ -100,7 +196,8 @@ class AppState:
             tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), "utf-8")
             tmp.replace(p)
 
-    def create_batch(self, name):
+    def create_batch(self, name, icc_id=None):
+        icc_id = self.icc_path(icc_id or DEFAULT_ICC).name
         batch_id = uuid.uuid4().hex[:12]
         root = self.batch_dir(batch_id)
         for child in BATCH_DIRS:
@@ -110,7 +207,8 @@ class AppState:
             "name": name.strip()[:80] or f"调色批次 {datetime.now():%m-%d %H:%M}",
             "created_at": utc_now(), "updated_at": utc_now(),
             "model": self.model_path.name,
-            "target_profile": "CMYK",
+            "cmyk_icc": icc_id,
+            "target_profile": icc_label(icc_id),
             "gains": dict(DEFAULT_GAINS),
             "curves": normalize_curves(None),
             "curves_status": "idle",
@@ -123,9 +221,10 @@ class AppState:
         rows = []
         for p in self.data_dir.glob("*/manifest.json"):
             try:
-                b = json.loads(p.read_text("utf-8"))
-                rows.append({k: b[k] for k in ("id", "name", "created_at", "updated_at")}
-                            | {"counts": self.counts(b), "target_profile": b.get("target_profile")})
+                b = self.with_icc_fields(json.loads(p.read_text("utf-8")))
+                rows.append({k: b[k] for k in ("id", "name", "created_at", "updated_at",
+                                               "cmyk_icc", "target_profile")}
+                            | {"counts": self.counts(b)})
             except (OSError, ValueError, KeyError):
                 continue
         return sorted(rows, key=lambda x: x["created_at"], reverse=True)
@@ -195,6 +294,7 @@ class AppState:
             self.write_batch(batch)
             return item.copy()
 
+    # ★★★ 核心：推理调用（曲线版）★★★
     def process_image(self, batch_id, image_id):
         item = self.update_item(batch_id, image_id, process_status="processing", error=None)
         root = self.batch_dir(batch_id)
@@ -205,8 +305,10 @@ class AppState:
                 target_path = root / "target" / item["target_file"]
 
             output_name = stored_name_with_suffix(image_id, item["filename"])
-            gains = (self.read_batch(batch_id).get("gains") or dict(DEFAULT_GAINS))
-            with self.infer_lock:
+            batch = self.read_batch(batch_id)
+            gains = batch.get("gains") or dict(DEFAULT_GAINS)
+            icc_path = self.batch_icc_path(batch)
+            with self.infer_lock, use_cmyk_icc(icc_path):
                 result = process_file(
                     image_path=str(input_path),
                     model=self.model,
@@ -242,6 +344,7 @@ class AppState:
                 metrics=result["metrics"],
                 review_status="pending" if target_path else "approved",
                 cmyk_file=out_path.name,
+                cmyk_icc=icc_path.name,
             )
             self.render_item_outputs(batch_id, image_id)
         except Exception as exc:
@@ -265,6 +368,10 @@ class AppState:
         batch = self.read_batch(batch_id)
         if curves is None:
             curves = batch.get("curves")
+        with use_cmyk_icc(self.batch_icc_path(batch)):
+            return self._render_item_outputs(batch_id, image_id, batch, curves)
+
+    def _render_item_outputs(self, batch_id, image_id, batch, curves):
         item = next((x for x in batch["images"] if x["id"] == image_id), None)
         if not item or not item.get("output_file"):
             return
@@ -382,6 +489,26 @@ class AppState:
                     batch["updated_at"] = utc_now()
                     self.write_batch(batch)
 
+    def set_batch_icc(self, batch_id, icc_id):
+        """切换批次的 CMYK ICC，并按原有流程（模型推理 → ICC 转 CMYK → 套曲线）重新处理整批。"""
+        icc_id = self.icc_path(icc_id).name
+        with self.lock:
+            batch = self.read_batch(batch_id)
+            batch["cmyk_icc"] = icc_id
+            batch["target_profile"] = icc_label(icc_id)
+            queued = []
+            for item in batch["images"]:
+                if not item.get("input_file"):
+                    continue
+                item.update(process_status="queued", error=None)
+                queued.append(item["id"])
+            batch["updated_at"] = utc_now()
+            self.write_batch(batch)
+        for image_id in queued:
+            self.executor.submit(self.process_image, batch_id, image_id)
+        return {"ok": True, "cmyk_icc": icc_id, "target_profile": icc_label(icc_id),
+                "queued": len(queued)}
+
     def curve_preview(self, batch_id, image_id, curves, size=900, page=0):
         """把曲线套在指定页的软打样底图上，返回可直接显示的 JPEG。"""
         batch = self.read_batch(batch_id)
@@ -400,11 +527,11 @@ class AppState:
         if not (proof_path and proof_path.is_file()):
             raise FileNotFoundError("软打样底图不存在")
         size = max(200, min(1600, int(size)))
-        with Image.open(proof_path) as img:
+        with use_cmyk_icc(self.batch_icc_path(batch)), Image.open(proof_path) as img:
             img.load()
             proofed = cmyk_to_srgb(apply_cmyk_curves(img, curves))
         proofed.thumbnail((size, size), Image.Resampling.LANCZOS)
-        raw, mime = pil_to_bytes(proofed, fmt="JPEG", quality=88)
+        raw, mime = _pil_to_bytes(proofed, fmt="JPEG", quality=88)
         return raw, mime, item["id"]
 
     def delivery_path(self, batch_id, item):
@@ -556,15 +683,18 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/config":
                 self.json_response({"max_upload_mb": self.app.max_upload_mb,
                                     "max_upload_bytes": self.app.max_upload_bytes})
+            elif parsed.path == "/api/icc-profiles":
+                self.json_response({"default": DEFAULT_ICC, "profiles": self.app.icc_profiles()})
             elif parsed.path == "/api/batches":
                 self.json_response(self.app.list_batches())
             elif len(parts) == 3 and parts[:2] == ["api", "batches"]:
-                batch = self.app.read_batch(parts[2])
+                batch = self.app.with_icc_fields(self.app.read_batch(parts[2]))
                 batch["counts"] = self.app.counts(batch)
                 self.json_response(batch)
             elif len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "download":
                 status = parse_qs(parsed.query).get("status", ["approved"])[0]
                 self.send_file(self.app.make_zip(parts[2], status), f"{parts[2]}_{status}.zip")
+            # ★★★ 新增：单张图片下载端点 ★★★
             elif len(parts) == 5 and parts[:2] == ["api", "batches"] and parts[4] == "download":
                 batch_id, image_id = parts[2], parts[3]
                 fmt = parse_qs(parsed.query).get("format", ["original"])[0]
@@ -646,7 +776,23 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             parts = [x for x in parsed.path.split("/") if x]
             if parsed.path == "/api/batches":
-                self.json_response(self.app.create_batch(self.read_json().get("name", "")), 201); return
+                data = self.read_json()
+                self.json_response(self.app.create_batch(data.get("name", ""), data.get("icc")), 201); return
+            if parsed.path == "/api/icc-profiles":
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > MAX_ICC_BYTES: raise ValueError("ICC 文件为空或超过 32 MB")
+                filename = parse_qs(parsed.query).get("filename", [""])[0]
+                icc_filename(filename)
+                tmp = self.app.icc_dir / f".{uuid.uuid4().hex}.upload"
+                try:
+                    self.receive_upload(tmp, length)
+                    profile = self.app.add_icc_profile(filename, tmp)
+                finally:
+                    tmp.unlink(missing_ok=True)
+                self.json_response(profile, 201); return
+            if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "icc":
+                data = self.read_json()
+                self.json_response(self.app.set_batch_icc(parts[2], data.get("icc")), 202); return
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "images":
                 length = int(self.headers.get("Content-Length", "0"))
                 if length <= 0 or length > self.app.max_upload_bytes: raise ValueError("单张图片超限")
@@ -712,7 +858,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser(description="印刷调色 Web 服务（CurvePredictor v3）")
-    ap.add_argument("--model", default=DEFAULT_MODEL, help="CurvePredictor 权重路径")
+    ap.add_argument("--model", default="checkpoints/curve_pred_best.pth", help="CurvePredictor 权重路径")   # ★ 默认改了
     ap.add_argument("--data", default="web_data", help="数据存储目录")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=5001)

@@ -1,136 +1,96 @@
-# 印刷调色预测（CurvePredictor + Web 审阅）
+# 修改后代码使用说明
 
-基于 **全局 RGB 曲线先验 + 参数化曲线预测器** 的印刷色差校正方案。支持命令行训练/推理，以及带批次审阅、CMYK 手工曲线与 PDF 分层保结构的 Web 服务。
+## 本次修改汇总（对应之前提出的 7 个问题）
 
-交付色彩空间默认使用 **PSOcoated_v3**（`utils/PSOcoated_v3.icc`）。
+| 优先级 | 问题 | 修改位置 | 状态 |
+|---|---|---|---|
+| P0 | 拉伸变形（未中心裁剪） | `dataset.py` `center_crop_square` | ✅ |
+| P0 | 验证只看 RGB MAE，无法对齐 LOSO | `train.py` `evaluate` 增加 CMYK MAE | ✅ |
+| P1 | 推理端无尺寸归一化 | `inference.py` 用 `center_crop_square` + resize | ✅ |
+| P1 | 训练效率低（反复读大图） | `prepare_cache.py` 离线缓存 + `dataset` 支持缓存 | ✅ |
+| P2 | 缺 Lab ΔE 损失 | `losses.py` `LabLoss` + `train.py` 接入 | ✅ |
+| P2 | `torch.meshgrid indexing=` 兼容性 | `color_space.py` 改手动广播 | ✅ |
+| P2 | 权重初始化/BN 小 batch | `residual_cnn.py` Kaiming 初始化 | ✅ |
 
 ## 目录结构
 
 ```
-├── app.py                  # Web 服务（批次上传、推理、审阅、CMYK 曲线）
-├── processor.py            # 推理核心：混合管线、ICC、PDF、CMYK 曲线
-├── config.py               # 训练与推理统一配置
-├── dataset.py              # 数据集（中心裁剪 + 可选离线缓存）
-├── prepare_cache.py        # 生成训练用 float16 缓存
-├── train.py                # 阶段 1：全局 Curve1D
-├── train_curve_pred.py     # 阶段 2：CurvePredictor（融合全局曲线）
-├── train_hybrid.py         # 可选：Curve1D + 残差 U-Net
-├── train_rgb.py            # RGB 曲线训练（辅助脚本）
-├── inference.py            # 单图 CLI 推理（Curve1D）
-├── infer_hybrid.py         # 混合模型对比推理
-├── eval_curve_pred.py      # 曲线预测器评估
-├── export_curve.py         # 导出 ACV/NPY/CSV 曲线
-├── export_curve_pred.py    # 导出预测器相关产物
-├── convert_to_cmyk.py      # CMYK 转换工具
-├── test_core.py            # 无 GPU 的核心逻辑测试
-├── verify_all.py           # 完整环境验证（需 PyTorch）
+print_color_transfer/
+├── config.py               # 配置（含 CACHE_DIR、LAB_WEIGHT、IMG_SIZE）
+├── dataset.py              # 数据集（中心裁剪 + 离线缓存）
+├── train.py                # 三阶段训练（LUT / 残差CNN / 联合）
+├── inference.py            # 推理（与训练同款中心裁剪）
+├── prepare_cache.py        # 离线缓存生成（训练前先跑）
+├── test_core.py            # 无torch环境的核心逻辑测试
+├── verify_all.py           # 有torch环境的完整验证（用户环境跑）
 ├── models/
-│   ├── curve_1d.py         # 1D RGB 曲线
-│   ├── curve_predictor.py  # 图像→曲线（全局先验凸组合）
-│   ├── skin_curve_net.py   # 肤色 LUT 修正（可选）
-│   ├── residual_unet.py    # 残差 U-Net（可选）
-│   ├── lut_3d.py           # 3D LUT（历史实验）
-│   └── residual_cnn.py     # CMYK 残差 CNN（历史实验）
-├── utils/                  # 色彩空间、ICC、损失函数
-├── web/                    # 前端静态资源
-├── scripts/                # 环境安装与启动脚本
-├── checkpoints/            # 模型权重（需自行训练或放置）
-└── web_data/               # Web 批次数据（运行时生成）
+│   ├── lut_3d.py           # 3D LUT（恒等初始化，三线性采样）
+│   └── residual_cnn.py     # 轻量残差 UNet（±0.05 限制）
+└── utils/
+    ├── color_space.py      # RGB<->CMYK, RGB->Lab
+    └── losses.py           # LabLoss + PerceptualLoss
 ```
 
-## 环境
+## 快速开始
+
+### 1. 验证代码（强烈建议先跑）
 
 ```bash
-# 新建虚拟环境并安装依赖
-./scripts/setup_env.sh
+# 有 torch 的环境（用户机器）：
+cd print_color_transfer
+python verify_all.py
+# 预期：全部 9 项 OK
 
-# 或复用已有 conda 环境
-./scripts/setup_env.sh --conda 你的环境名
-
-pip install -r requirements.txt
+# 无 torch 的环境（当前沙盒）：
+python test_core_standalone.py
 ```
 
-主要依赖：`torch`、`numpy`、`pillow`、`scikit-image`、`pypdfium2`、`pypdf`。
-
-## 数据与配置
-
-1. 在 `config.py` 中设置 `DATA_DIR`（也可用环境变量 `PRINT_DATA_DIR`），样本命名见 `dataset.py`（`*_input` / `*_target`）。
-2. 大图训练建议先跑缓存：
+### 2. 生成离线缓存（约 10-20 分钟，只需一次）
 
 ```bash
 python prepare_cache.py
+# 把 6000×4000 原图中心裁剪 + resize 到 512×512，存为 float16 npy
+# 之后训练直接读小图，速度提升 ~10x
 ```
 
-3. 全局曲线先验需存在于 `checkpoints/global_curve.pt`（由阶段 1 训练或导出产生），CurvePredictor 加载时会强制校验。
-
-## 训练流程（推荐顺序）
-
-一键（mask → 全局曲线 → 预测器 → 肤色 → U-Net）：
+### 3. 训练
 
 ```bash
-python train_all.py --data-dir /path/to/pairs
+python train.py
 ```
 
-分步：
+训练流程：
+- **阶段 1**（30 epoch）：只训 LUT，验证打印 `RGB MAE` 和 `CMYK MAE`
+- **阶段 2**（30 epoch）：冻结 LUT，训残差 CNN，输入为 `(orig_cmyk, lut_cmyk)` 拼接
+- **阶段 3**（10 epoch）：联合微调
 
-| 阶段 | 脚本 | 产物 |
-|------|------|------|
-| 0 | `python generate_masks.py --data-dir ...` | `mask_cache/*_person.npy`、`*_face.npy` |
-| 1 | `python global_curve.py` 或 `train.py` | `checkpoints/global_curve.pt` |
-| 2 | `python train_curve_pred.py` | `curve_pred_best.pth`（缺失全局曲线时会自动拟合） |
-| 3 | `python train_skin_curve.py` | `skin_curve_best.pth` |
-| 4 | `python train_curve_unet.py` | `unet_best.pth`（空间门控 U-Net v3） |
+**关键验收线**（对齐 LOSO）：
+- LUT 阶段 `Val CMYK MAE` 应接近 **0.114**（Global 基线）
+- 最终 `Val CMYK MAE` 应 **≤ 0.110**（Oracle 上限 0.1099）
+- 若最终 CMYK MAE 与 LUT 阶段几乎相同 → 残差 CNN 没学到，可去掉（印证路线Ⅰ）
 
-历史脚本 `train_hybrid.py` / `train.py` 仍可用，与新管线并存。
-
-`processor.load_model()` 会在主权重同目录下自动尝试加载 `skin_curve_best.pth`、`unet_best.pth`，组成 **HybridPipeline**（全局曲线 → 肤色曲线 → U-Net 残差）。
-
-验证：
+### 4. 推理
 
 ```bash
-python test_core.py      # 轻量检查
-python verify_all.py     # 需完整 PyTorch 环境
-python eval_curve_pred.py
+python inference.py test.jpg output.jpg
 ```
 
-## Web 服务
+推理与训练完全对齐：同一 `center_crop_square` + 512 resize，同一 LUT/残差串联。
 
-```bash
-./scripts/start_app.sh
-# 或
-python app.py --host 0.0.0.0 --port 5001 --model checkpoints/curve_pred_best.pth --data web_data
-```
+## 重要提醒
 
-功能概要：
+1. **`DATA_DIR`** 改为你真实数据路径（默认 `/home/admin/picture_data/clean_out/clean`）
+2. **`NUM_WORKERS=0`**（默认），多进程 dataloader 若有 pickle 问题就保持 0
+3. **验证指标以 CMYK MAE 为准**，RGB MAE 仅供参考，不要与实验A的 0.0326 比较
+4. 如果显存不足，调小 `LUT_BATCH_SIZE` / `RESNET_BATCH_SIZE`
+5. 当前 pipeline 未接入 ICC 色彩管理（RGB 直接当 sRGB）。若数据集混有 AdobeRGB 等，需先统一到 sRGB——可后续在 `dataset._load_or_cache` 中加入 embedded ICC 探测（复用之前 `auto_rgb_profile` 逻辑）
 
-- 批次创建、多图/PDF 上传、后台推理队列
-- 输出 **CMYK 印刷稿**（TIFF/PDF）与 **sRGB 软打样预览**
-- PDF 优先 **保留分层** 替换嵌入图；失败时回退整页栅格重组
-- 批次级 **CMYK 手工曲线**（主曲线 + C/M/Y/K），实时预览与整批重渲染
-- 可选上传目标图，计算 ΔE00 / MAE
-- 按审阅状态打包 ZIP 下载
+## 验收线对照表
 
-Mac 部署可参考 `scripts/deploy_mac.sh`、`scripts/install_autostart.sh`。
+| 阶段 | 指标 | 目标值 | 含义 |
+|---|---|---|---|
+| LUT 最佳 | CMYK MAE | ~0.114 | 全局曲线基线（对齐 LOSO Global） |
+| 最终 | CMYK MAE | ≤ 0.110 | 达到 Oracle 上限（对齐 LOSO） |
+| 实验A | 像素 <2% 比例 | 69.2% | 曲线可覆盖比例（参考） |
 
-## 命令行推理
-
-```bash
-# Curve1D / 旧版单图推理
-python inference.py --image input.jpg --save_dir out/
-
-# 混合模型三路对比
-python infer_hybrid.py --image input.jpg --use_unet
-```
-
-生产 Web 与批量处理统一走 `processor.process_file()`，与 CLI 共用同一套 ICC 与混合推理逻辑。
-
-## 指标说明
-
-- **训练/验证**：曲线阶段以 RGB 与 Lab 相关损失为主；CMYK 评估需经 ICC 往返，与 LOSO 实验对齐时以 **CMYK MAE / ΔE** 为准。
-- **Web 审阅**：有目标图时在 sRGB 空间计算 **ΔE00** 与 **MAE**。
-
-## 常见问题
-
-1. **显存不足**：减小 `config.py` 中 `PRED_BATCH_SIZE`、`CURVE_BATCH_SIZE`；Web 端大图会自动分块推理（见 `processor.py` 中 `TILE_*` 常量）。
-2. **PDF 过大**：已提高 `pypdf` 流大小上限；分层失败时会打印日志并回退 TIFF 页重组。
-3. **输入 ICC**：嵌入 PDF 图或带 ICC 的 TIFF 会优先用 embedded profile 转 sRGB，再进模型；无 ICC 的 CMYK 走 PSOcoated_v3。
+若最终 CMYK MAE 无法降到 0.110 以下，说明 30% 残差是随机噪声、非结构化，**残差 CNN 收益有限**，纯 LUT 即可交付。

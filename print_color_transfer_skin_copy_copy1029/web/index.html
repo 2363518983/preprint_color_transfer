@@ -33,6 +33,11 @@
           </div>
           <label class="field-label" for="batchName">批次名称</label>
           <input id="batchName" class="text-input" placeholder="例如：八月产品画册">
+          <label class="field-label" for="batchIcc">CMYK 输出 ICC</label>
+          <div class="icc-row">
+            <select id="batchIcc" class="select"></select>
+            <button id="batchIccUpload" class="button secondary compact" type="button">+ 上传 ICC</button>
+          </div>
           <div id="dropzone" class="dropzone" tabindex="0">
             <input id="fileInput" type="file" accept="image/jpeg,image/png,image/tiff,application/pdf,.pdf" multiple hidden>
             <div class="drop-icon">↥</div>
@@ -68,6 +73,8 @@
         <div><button class="back-link" id="backButton">← 返回批量处理</button><p class="eyebrow">QUALITY CONTROL</p><h1 id="reviewTitle">审核工作台</h1><p id="reviewMeta" class="muted"></p></div>
         <div class="review-actions">
           <select id="statusFilter" class="select"><option value="all">全部图片</option><option value="pending">待审核</option><option value="approved">已通过</option><option value="rejected">已驳回</option></select>
+          <select id="reviewIcc" class="select" title="切换 CMYK 输出 ICC 后整批重新渲染"></select>
+          <button id="reviewIccUpload" class="button secondary compact" type="button">+ 上传 ICC</button>
           <button id="curveButton" class="button secondary compact" type="button">CMYK 曲线调整</button>
           <a id="downloadButton" class="button primary compact" href="#">下载已通过结果</a>
           <button id="deleteBatchButton" class="button danger compact" type="button">删除批次</button>
@@ -120,11 +127,11 @@
           <select id="curveImage" class="select"></select>
           <select id="curvePage" class="select hidden"></select>
           <div class="curve-preview"><img id="curvePreview" alt="CMYK 软打样预览"></div>
-          <p class="muted" id="curveStatus">预览为 CMYK 软打样（PSOcoated_v3）</p>
+          <p class="muted" id="curveStatus">预览为交付文件软打样</p>
         </aside>
       </div>
       <footer class="modal-foot">
-        <span class="muted" id="curveFootHint">调整只影响交付的 CMYK 文件，模型调色结果保留为基准。</span>
+        <span class="muted" id="curveFootHint">曲线写进交付的 CMYK 文件。分层写入失败时，用整页 TIFF 重组。</span>
         <div class="modal-actions">
           <button id="curveCancel" class="button secondary compact" type="button">取消</button>
           <button id="curveApply" class="button primary compact" type="button">应用到整批</button>
@@ -133,6 +140,7 @@
     </div>
   </div>
 
+  <input id="iccFileInput" type="file" accept=".icc,.icm" hidden>
   <div id="toast" class="toast"></div>
   <script src="/app.js"></script>
 </body>

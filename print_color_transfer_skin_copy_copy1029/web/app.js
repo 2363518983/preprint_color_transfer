@@ -6,7 +6,7 @@ const state = {
     batch: null,
     poll: null,
     compareModes: {},   // 每个文件的对比模式：'input' 或 'target'
-    viewModes: {},      // 每个文件的查看模式：'compare' / 'pdf-out' / 'pdf-in'
+    viewModes: {},      // 保留字段，审核页不再用 iframe 打开 CMYK PDF
     selectedId: null,   // 左侧列表当前选中的文件
     pageIndex: 0,       // 多页 PDF 当前页
     uploadedFiles: { inputs: [], targets: [] },
@@ -19,7 +19,11 @@ const state = {
     curveDiscard: false,
     curvePreviewTimer: null,
     curvePreviewUrl: null,
-    curvePoll: null
+    curvePoll: null,
+    iccProfiles: [],
+    defaultIcc: null,
+    iccUploadTarget: 'batch',   // 'batch'：新建批次用；'review'：当前批次切换并重新渲染
+    reviewPoll: null
 };
 
 function identityCurves() {
@@ -127,7 +131,7 @@ $('#startButton').onclick = async () => {
         const batch = await api('/api/batches', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name })
+            body: JSON.stringify({ name, icc: $('#batchIcc').value || null })
         });
         state.batchId = batch.id;
 
@@ -252,6 +256,7 @@ async function openReview(id) {
         $('#reviewMeta').textContent =
             `${b.target_profile || 'CMYK'} 输出${curveNote} · 创建于 ${new Date(b.created_at).toLocaleString()}`;
         $('#profileName').textContent = b.target_profile || 'CMYK';
+        renderIccSelects();
         $('#downloadButton').href = `/api/batches/${id}/download?status=approved`;
         renderStats(b.counts || {});
         renderReview();
@@ -359,7 +364,6 @@ function renderViewer() {
     const v = mediaVersion();
     const hasTarget = !!item.target_file;
     const mode = state.compareModes[item.id] || (hasTarget ? 'target' : 'input');
-    const viewMode = state.viewModes[item.id] || 'compare';
 
     const inputUrl = `/media/${state.batchId}/${item.id}/input-preview?page=${p}&v=${v}`;
     const outputUrl = `/media/${state.batchId}/${item.id}/preview?page=${p}&v=${v}`;
@@ -369,26 +373,15 @@ function renderViewer() {
 
     const de = item.metrics?.mean_delta_e;
     const dl = downloadName(item.filename);
-    const pdfViews = item.is_pdf ? `
-        <button class="view-mode ${viewMode === 'pdf-out' ? 'active' : ''}" data-id="${item.id}" data-view="pdf-out">输出 PDF</button>
-        <button class="view-mode ${viewMode === 'pdf-in' ? 'active' : ''}" data-id="${item.id}" data-view="pdf-in">原 PDF</button>` : '';
-
-    let stage;
-    if (viewMode === 'pdf-out' || viewMode === 'pdf-in') {
-        const which = viewMode === 'pdf-out' ? 'output' : 'input';
-        stage = `<iframe class="pdf-frame" src="/media/${state.batchId}/${item.id}/${which}?inline=1&v=${v}"
-                   title="PDF 预览"></iframe>`;
-    } else {
-        stage = `
+    const stage = `
             <div class="compare large">
                 <img class="before" src="${before}">
                 <img class="after" src="${outputUrl}">
                 <div class="divider"></div>
                 <span class="compare-label before-label">${beforeLabel}</span>
-                <span class="compare-label after-label">输出（CMYK 软打样）</span>
+                <span class="compare-label after-label">输出（交付文件软打样）</span>
                 <input type="range" min="0" max="100" value="50" aria-label="拖动比较">
             </div>`;
-    }
 
     const pager = pages > 1 ? `
         <div class="pager">
@@ -402,11 +395,7 @@ function renderViewer() {
         <div class="viewer-head">
             <div>
                 <h3 title="${escapeAttr(item.filename)}">${escapeHtml(item.filename)}</h3>
-                <p class="muted">${item.width}×${item.height}${pages > 1 ? ` · ${pages} 页` : ''}${de ? ` · ΔE ${de.toFixed(2)}` : ''}</p>
-            </div>
-            <div class="view-switch">
-                <button class="view-mode ${viewMode === 'compare' ? 'active' : ''}" data-id="${item.id}" data-view="compare">对比</button>
-                ${pdfViews}
+                <p class="muted">${item.width}×${item.height}${pages > 1 ? ` · ${pages} 页` : ''}${de ? ` · ΔE ${de.toFixed(2)}` : ''} · 预览为交付 PDF 栅格后的软打样</p>
             </div>
         </div>
         ${stage}
@@ -443,9 +432,6 @@ function bindViewerEvents() {
     });
     document.querySelectorAll('.compare-mode').forEach(btn => {
         btn.onclick = () => { state.compareModes[btn.dataset.id] = btn.dataset.mode; renderViewer(); };
-    });
-    document.querySelectorAll('.view-mode').forEach(btn => {
-        btn.onclick = () => { state.viewModes[btn.dataset.id] = btn.dataset.view; renderViewer(); };
     });
     document.querySelectorAll('.pager-btn').forEach(btn => {
         btn.onclick = () => { state.pageIndex = Number(btn.dataset.page); renderViewer(); };
@@ -967,9 +953,10 @@ async function refreshCurvePreview() {
         if (state.curvePreviewUrl) URL.revokeObjectURL(state.curvePreviewUrl);
         state.curvePreviewUrl = URL.createObjectURL(blob);
         $('#curvePreview').src = state.curvePreviewUrl;
+        const profile = state.batch?.target_profile || 'CMYK';
         $('#curveStatus').textContent = curvesAreIdentity(state.curves)
-            ? '当前为原始输出（CMYK 软打样，PSOcoated_v3）'
-            : '已套用曲线（CMYK 软打样，PSOcoated_v3）';
+            ? `当前为交付文件软打样（${profile}）`
+            : `已套用曲线（交付文件软打样 · ${profile}）`;
     } catch (e) {
         $('#curveStatus').textContent = e.message;
     }
@@ -1012,6 +999,118 @@ function pollCurveStatus() {
     }, 1500);
 }
 
+// ---------- CMYK ICC 选择 / 上传 / 整批重新渲染 ----------
+async function loadIccProfiles() {
+    const data = await api('/api/icc-profiles');
+    state.iccProfiles = data.profiles || [];
+    state.defaultIcc = data.default || state.iccProfiles[0]?.id || null;
+    renderIccSelects();
+}
+
+function iccOptionsHtml() {
+    return state.iccProfiles.map(p => {
+        const tags = [p.default ? '默认' : '', p.builtin ? '' : '上传'].filter(Boolean);
+        const label = `${p.name}${tags.length ? `（${tags.join('·')}）` : ''}`;
+        return `<option value="${escapeAttr(p.id)}" title="${escapeAttr(p.description || p.id)}">${escapeHtml(label)}</option>`;
+    }).join('');
+}
+
+function renderIccSelects() {
+    const html = iccOptionsHtml();
+    const batchSelect = $('#batchIcc');
+    const keep = batchSelect.value;
+    batchSelect.innerHTML = html;
+    const ids = state.iccProfiles.map(p => p.id);
+    batchSelect.value = ids.includes(keep) ? keep : (state.defaultIcc || '');
+
+    const reviewSelect = $('#reviewIcc');
+    reviewSelect.innerHTML = html;
+    const current = state.batch?.cmyk_icc || state.defaultIcc;
+    if (current && !ids.includes(current)) {
+        reviewSelect.insertAdjacentHTML('beforeend',
+            `<option value="${escapeAttr(current)}">${escapeHtml(current)}（文件缺失）</option>`);
+    }
+    reviewSelect.value = current || '';
+}
+
+function iccName(id) {
+    return state.iccProfiles.find(p => p.id === id)?.name || id;
+}
+
+async function uploadIccFile(file) {
+    const response = await fetch(`/api/icc-profiles?filename=${encodeURIComponent(file.name)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: file
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(data?.error || 'ICC 上传失败');
+    await loadIccProfiles();
+    return data;
+}
+
+async function switchBatchIcc(iccId) {
+    if (!state.batchId || !state.batch) return;
+    if (!iccId || iccId === state.batch.cmyk_icc) { renderIccSelects(); return; }
+    const total = (state.batch.images || []).length;
+    const ok = confirm(`切换为「${iccName(iccId)}」后，将按原有流程重新处理整批 ${total} 个文件`
+        + '（模型调色 → 新 ICC 转 CMYK → 套用当前曲线），确定？');
+    if (!ok) { renderIccSelects(); return; }
+    try {
+        await api(`/api/batches/${state.batchId}/icc`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ icc: iccId })
+        });
+        toast(`已切换为 ${iccName(iccId)}，正在重新渲染整批…`);
+        await openReview(state.batchId);
+        pollReviewProcessing();
+    } catch (e) {
+        toast(e.message);
+        renderIccSelects();
+    }
+}
+
+function pollReviewProcessing() {
+    clearInterval(state.reviewPoll);
+    const batchId = state.batchId;
+    state.reviewPoll = setInterval(async () => {
+        if (state.batchId !== batchId || !location.hash.startsWith('#review')) {
+            clearInterval(state.reviewPoll);
+            return;
+        }
+        await openReview(batchId);
+        const counts = state.batch?.counts || {};
+        if (!counts.processing) {
+            clearInterval(state.reviewPoll);
+            toast(counts.failed ? `重新渲染完成，${counts.failed} 个失败` : '整批已按新 ICC 重新渲染');
+        }
+    }, 2000);
+}
+
+function initIccControls() {
+    const fileInput = $('#iccFileInput');
+    $('#batchIccUpload').onclick = () => { state.iccUploadTarget = 'batch'; fileInput.click(); };
+    $('#reviewIccUpload').onclick = () => { state.iccUploadTarget = 'review'; fileInput.click(); };
+    $('#reviewIcc').onchange = () => switchBatchIcc($('#reviewIcc').value);
+    fileInput.onchange = async () => {
+        const file = fileInput.files[0];
+        fileInput.value = '';
+        if (!file) return;
+        try {
+            const profile = await uploadIccFile(file);
+            toast(`ICC 已上传：${profile.name}`);
+            if (state.iccUploadTarget === 'review') {
+                await switchBatchIcc(profile.id);
+            } else {
+                $('#batchIcc').value = profile.id;
+            }
+        } catch (e) {
+            toast(e.message);
+        }
+    };
+}
+
 function escapeHtml(s) {
     const d = document.createElement('div');
     d.textContent = s;
@@ -1027,6 +1126,10 @@ async function init() {
         const config = await api('/api/config');
         $('#uploadHint').textContent = `可一次选择多张，单张不超过 ${config.max_upload_mb} MB`;
     } catch (e) { /* 非关键 */ }
+    initIccControls();
+    try {
+        await loadIccProfiles();
+    } catch (e) { toast(`ICC 列表加载失败：${e.message}`); }
     initCurveCanvas();
     $('#curveButton').onclick = openCurveModal;
     loadBatches();

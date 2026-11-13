@@ -1,20 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-残差 U-Net v3（空间门控版）
-
-改动（相比 v2）：
-- ★ 移除全局标量 residual_gate
-- ★ 新增空间门控头 gate_head：per-pixel 门控 (B,1,H,W)
-    初始 bias = -4.6 → sigmoid(-4.6) ≈ 0.01 → 初始残差 std≈0.0067
-- ★ forward 支持 return_gate=True，训练时可拿到 gate 做正则
-- 向后兼容：默认 forward(x) 只返回 output tensor，与旧接口一致
-  （processor.py 不需要改）
-
-★ 注意：结构已变，加载旧的 unet_best.pth 会报错，重训前请备份。
+残差 U-Net v2（可学习残差门控）：
+- out_conv 用 Kaiming 初始化（正常）
+- ★ residual_gate 可学习参数，初始 0.01 → 初始残差 std≈0.0067
+- 训练时 gate 自动决定残差幅度，无需外部 scale
 """
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from models.curve_1d import Curve1D
 
 
 class DoubleConv(nn.Module):
@@ -60,7 +56,7 @@ class Up(nn.Module):
 
 class ResidualUNet(nn.Module):
     """输入 (B,6,H,W) → 输出 (B,3,H,W)。
-    ★ 输出残差被 per-pixel 空间门控缩放，初始门控≈0.01，安全接入主链路。
+    ★ 输出的残差被 residual_gate 缩放，初始≈0.0067，安全接入主链路。
     """
 
     def __init__(self, in_ch=6, base=48, out_ch=3):
@@ -76,16 +72,13 @@ class ResidualUNet(nn.Module):
         self.up2 = Up(c2, c2, c1)
         self.up1 = Up(c1, c1, c1)
 
-        # 残差头
         self.out_conv = nn.Conv2d(c1, out_ch, 1)
         nn.init.kaiming_normal_(self.out_conv.weight, mode="fan_in", nonlinearity="linear")
 
-        # ★ 空间门控头：per-pixel，初始 ≈ 0.01
-        self.gate_head = nn.Conv2d(c1, 1, 1)
-        nn.init.zeros_(self.gate_head.weight)
-        nn.init.constant_(self.gate_head.bias, -4.6)   # sigmoid(-4.6) ≈ 0.00996
+        # ★★★ 可学习残差门控（初始 0.01）★★★
+        self.residual_gate = nn.Parameter(torch.tensor(0.01))
 
-    def forward(self, x, return_gate=False):
+    def forward(self, x, B=None):
         c1 = self.enc1(x)
         c2 = self.enc2(c1)
         c3 = self.enc3(c2)
@@ -94,23 +87,70 @@ class ResidualUNet(nn.Module):
         u3 = self.up3(b, c3)
         u2 = self.up2(u3, c2)
         u1 = self.up1(u2, c1)
+        raw = self.out_conv(u1)                      # (B,3,H,W)，std≈0.67
+        return raw * self.residual_gate              # 初始 std≈0.0067
 
-        raw = self.out_conv(u1)                     # (B,3,H,W)，std≈0.67
-        gate = torch.sigmoid(self.gate_head(u1))    # (B,1,H,W) ∈ (0,1)
-        out = raw * gate
 
-        if return_gate:
-            return out, gate
-        return out
+def _check_bchw(name, t, expected_b=None):
+    if t.dim() != 4:
+        raise RuntimeError(f"{name} 应为 BCHW，实际 {tuple(t.shape)}")
+    if expected_b is not None and t.size(0) != expected_b:
+        raise RuntimeError(f"{name} batch 维应为 {expected_b}，实际 {t.size(0)}")
+
+
+class HybridColorModel(nn.Module):
+    """Curve1D（全局）+ ResidualUNet（局部残差）。供旧训练脚本使用。"""
+
+    def __init__(self, n_bins=33, unet_base=32, residual_scale=0.03,
+                 pretrained_curve=None):
+        super().__init__()
+        self.curve = Curve1D(channels=3, n_bins=n_bins)
+        self.unet = ResidualUNet(in_ch=6, base=unet_base, out_ch=3)
+        self.residual_scale = residual_scale
+        if pretrained_curve is not None:
+            self._load_curve(pretrained_curve)
+
+    def _load_curve(self, path):
+        if isinstance(path, str):
+            if path.endswith(".npy"):
+                curves = torch.from_numpy(np.load(path)).float()
+                with torch.no_grad():
+                    self.curve.curves.copy_(curves)
+                return
+            sd = torch.load(path, map_location="cpu", weights_only=False)
+            if isinstance(sd, dict) and "curves" in sd:
+                sd = {"curves": sd["curves"]}
+            self.curve.load_state_dict(sd, strict=False)
+        else:
+            self.curve.load_state_dict(path, strict=False)
+
+    def freeze_curve(self):
+        for p in self.curve.parameters():
+            p.requires_grad = False
+        self.curve.eval()
+
+    def apply_curves(self, x):
+        return self.curve(x).clamp(0, 1)
+
+    def forward_base(self, x):
+        return self.apply_curves(x)
+
+    def forward(self, x, use_unet=True):
+        base = self.apply_curves(x)
+        _check_bchw("base", base, x.size(0))
+        if not use_unet:
+            return base
+        residual = self.unet(torch.cat([x, base], dim=1), B=x.size(0))
+        return (base + self.residual_scale * residual).clamp(0, 1)
 
 
 if __name__ == "__main__":
     torch.manual_seed(0)
     unet = ResidualUNet(in_ch=6, base=48, out_ch=3)
     x = torch.rand(2, 6, 256, 256)
-    out, gate = unet(x, return_gate=True)
-    print(f"输出 shape={tuple(out.shape)}, std={out.std().item():.6f}")
-    print(f"gate mean={gate.mean().item():.4f}, min={gate.min().item():.4f}, max={gate.max().item():.4f}")
+    out = unet(x)
+    print(f"初始化: shape={tuple(out.shape)}, std={out.std().item():.6f}")
+    print(f"residual_gate: {unet.residual_gate.item():.4f}")
 
     loss = out.abs().mean()
     loss.backward()
