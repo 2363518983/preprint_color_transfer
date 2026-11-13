@@ -4,9 +4,12 @@ import io
 import os
 import json
 import shutil
+import traceback
 import uuid
 import zlib
 import inspect
+import threading
+from contextlib import contextmanager
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -27,66 +30,22 @@ except ImportError:
 # ============================================================
 
 def _raise_pypdf_limits():
-    """
-    大尺寸 CMYK 图像会让 pypdf 触发多个内置安全限制：
-      - ZLIB_MAX_OUTPUT_LENGTH：单次解压输出上限
-      - MAX_STREAM_LENGTH：stream 声明长度上限
-      - MAX_IMAGE_BUFFER_SIZE：解码图像缓冲上限（★ 新增）
-      - MAX_IMAGE_PIXELS：图像像素总数上限（★ 新增）
-    这里全部调大，避免处理印刷级 PDF 时被拒绝。
-    """
-    # 1) filters 模块的 zlib 解压上限
+    """印刷 PDF 的流经常超过 pypdf 默认 75MB，统一抬到 1.5GB。"""
     try:
-        import pypdf.filters as f
-        for name in ("ZLIB_MAX_OUTPUT_LENGTH", "MAX_ZLIB_OUTPUT_LENGTH"):
-            if hasattr(f, name):
-                setattr(f, name, 8 * 1024 * 1024 * 1024)
-        for name in ("MAX_STREAM_LENGTH", "MAX_DECLARED_STREAM_LENGTH"):
-            if hasattr(f, name):
-                setattr(f, name, 2 ** 50)
-    except Exception:
-        pass
-
-    # 2) _data_structures 里对 Length 声明的限制
-    try:
-        import pypdf.generic._data_structures as ds
-        for name in ("MAX_STREAM_LENGTH", "MAX_DECLARED_STREAM_LENGTH"):
-            if hasattr(ds, name):
-                setattr(ds, name, 2 ** 50)
-    except Exception:
-        pass
-
-    # 3) 兜底：monkey-patch _decompress_with_limit，无视参数只做一次解压
-    try:
-        import pypdf.filters as f
-        if hasattr(f, "_decompress_with_limit"):
-            def _unlimited_decompress(data, max_length=None):
-                import zlib as _zlib
-                try:
-                    return _zlib.decompress(data)
-                except _zlib.error:
-                    return _zlib.decompressobj().decompress(data)
-            f._decompress_with_limit = _unlimited_decompress
-    except Exception:
-        pass
-
-    # 4) ★ 通杀所有模块里的图像缓冲/像素限制常量
-    try:
-        import pypdf, pkgutil, importlib
-        for modinfo in pkgutil.walk_packages(pypdf.__path__, prefix="pypdf."):
-            try:
-                mod = importlib.import_module(modinfo.name)
-            except Exception:
-                continue
-            for const in ("MAX_IMAGE_BUFFER_SIZE",
-                          "MAX_IMAGE_PIXELS",
-                          "IMAGE_BUFFER_SIZE_LIMIT",
-                          "MAX_DECODED_IMAGE_SIZE"):
-                if hasattr(mod, const):
-                    setattr(mod, const, 2 ** 40)
-                    print(f"[pypdf] 提升 {modinfo.name}.{const} = 2**40")
-    except Exception:
-        pass
+        from pypdf._configuration import overwrite_configuration
+        import pypdf  # noqa: F401
+    except ImportError:
+        return
+    _GB = 1_500_000_000
+    overwrite_configuration(
+        maximum_declared_stream_length=_GB,
+        array_based_stream_maximum_output_length=_GB,
+        zlib_maximum_output_length=_GB,
+        image_maximum_buffer_size=_GB,
+        jbig2_maximum_output_length=_GB,
+        lzw_maximum_output_length=_GB,
+        run_length_maximum_output_length=_GB,
+    )
 
 
 _raise_pypdf_limits()
@@ -139,8 +98,8 @@ def _amplify_lut(curves, gain):
 
 TILE_TRIGGER_PIXELS = 4000 * 4000
 TILE_SIZE = 2048
-TILE_OVERLAP = 512
-UNET_SIZE = 512
+TILE_OVERLAP = 256
+
 
 def _tile_ranges(total, tile_size, overlap):
     if total <= tile_size:
@@ -195,7 +154,6 @@ def _generate_hybrid_stages(img_np, pipeline,
     try:
         t = torch.from_numpy(np.ascontiguousarray(img_np)).permute(2, 0, 1).unsqueeze(0).float().to(device)
 
-        # ---------- Stage 1: 全局曲线 ----------
         size = Config.PRED_INPUT_SIZE
         resized = F.interpolate(t, size=(size, size), mode="bilinear", align_corners=False)
         curves1 = pipeline.curve_model.forward(resized)
@@ -207,33 +165,21 @@ def _generate_hybrid_stages(img_np, pipeline,
         else:
             base1_t, _ = pipeline.curve_model.apply(t, resize_size=size)
 
-        # ---------- Stage 2: 肤色曲线（限制在肤色 mask 内应用） ----------
-        if pipeline.skin_model is not None and skin_gain != 0:
-            # 训练时模型见过的 mask 分布 = YCrCb 肤色阈值
-            model_mask = _skin_mask_batch(base1_t)              # (B,1,H,W)
-
-            # 保护：若肤色 mask 覆盖率过高，说明背景暖色被大面积误检，跳过 Stage2
-            coverage = float(model_mask.mean().item())
-            if coverage > 0.5:
-                print(f"   [Stage2] 肤色 mask 覆盖率 {coverage:.1%} 过高，跳过肤色修正")
-                base2_t = base1_t
-            else:
-                curves2 = pipeline.skin_model(base1_t, mask=model_mask)
-                curves2 = _amplify_lut(curves2, skin_gain)
-
-                # ★ 关键：只在 mask 内应用曲线，mask 外保持 Stage1 结果
-                base2_raw = apply_lut(base1_t, curves2)
-                base2_t = base1_t * (1.0 - model_mask) + base2_raw * model_mask
-                del curves2, base2_raw, model_mask
+        if pipeline.skin_model is not None:
+            mask = _skin_mask_batch(base1_t)
+            curves2 = pipeline.skin_model(base1_t, mask=mask)
+            del mask
+            curves2 = _amplify_lut(curves2, skin_gain)
+            base2_t = apply_lut(base1_t, curves2)
+            del curves2
         else:
             base2_t = base1_t
 
-        # ---------- Stage 3: U-Net 残差 ----------
         if pipeline.unet_model is not None:
             amp_enabled = use_amp and device.type == "cuda"
             with torch.autocast(device_type="cuda", enabled=amp_enabled):
-                inp_small = F.interpolate(t, size=(UNET_SIZE, UNET_SIZE), mode="bilinear", align_corners=False)
-                base_small = F.interpolate(base2_t, size=(UNET_SIZE, UNET_SIZE), mode="bilinear", align_corners=False)
+                inp_small = F.interpolate(t, size=(256, 256), mode="bilinear", align_corners=False)
+                base_small = F.interpolate(base2_t, size=(256, 256), mode="bilinear", align_corners=False)
                 cat_in = torch.cat([inp_small, base_small], dim=1)
                 del inp_small, base_small
                 residual = pipeline.unet_model(cat_in)
@@ -279,19 +225,13 @@ def _generate_hybrid_stages_tiled(img_np, pipeline,
         base1_t, _ = pipeline.curve_model.apply(full_t, resize_size=size)
 
     # 阶段 2：整图肤色 mask + 肤色曲线
-    if pipeline.skin_model is not None and skin_gain != 0:
-        model_mask = _skin_mask_batch(base1_t)
-        coverage = float(model_mask.mean().item())
-        if coverage > 0.5:
-            print(f"   [Stage2] 肤色 mask 覆盖率 {coverage:.1%} 过高，跳过肤色修正")
-            base2_t = base1_t
-            del model_mask
-        else:
-            curves2 = pipeline.skin_model(base1_t, mask=model_mask)
-            curves2 = _amplify_lut(curves2, skin_gain)
-            base2_raw = apply_lut(base1_t, curves2)
-            base2_t = base1_t * (1.0 - model_mask) + base2_raw * model_mask
-            del curves2, base2_raw, model_mask
+    if pipeline.skin_model is not None:
+        mask = _skin_mask_batch(base1_t)
+        curves2 = pipeline.skin_model(base1_t, mask=mask)
+        del mask
+        curves2 = _amplify_lut(curves2, skin_gain)
+        base2_t = apply_lut(base1_t, curves2)
+        del curves2
     else:
         base2_t = base1_t
 
@@ -317,8 +257,8 @@ def _generate_hybrid_stages_tiled(img_np, pipeline,
                 t_tile = full_t[:, :, y0:y1, x0:x1]
                 b_tile = base2_t[:, :, y0:y1, x0:x1]
                 with torch.autocast(device_type="cuda", enabled=amp_enabled):
-                    inp_small = F.interpolate(t_tile, size=(UNET_SIZE, UNET_SIZE), mode="bilinear", align_corners=False)
-                    b_small = F.interpolate(b_tile, size=(UNET_SIZE, UNET_SIZE), mode="bilinear", align_corners=False)
+                    inp_small = F.interpolate(t_tile, size=(256, 256), mode="bilinear", align_corners=False)
+                    b_small = F.interpolate(b_tile, size=(256, 256), mode="bilinear", align_corners=False)
                     cat_in = torch.cat([inp_small, b_small], dim=1)
                     del inp_small, b_small
                     res = pipeline.unet_model(cat_in)
@@ -537,57 +477,99 @@ def load_model(model_path: str, device: str = None):
 # ICC 转换
 # ============================================================
 
-_CMYK_ICC = os.path.join("utils", "PSOcoated_v3.icc")
+ICC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "utils")
+DEFAULT_CMYK_ICC = os.path.join(ICC_DIR, "PSOcoated_v3.icc")
+_CMYK_ICC = DEFAULT_CMYK_ICC
 _INTENT = ImageCms.Intent.RELATIVE_COLORIMETRIC
 _FLAGS = ImageCms.Flags.BLACKPOINTCOMPENSATION
 
-_srgb_profile = None
-_cmyk_profile = None
-_rgb_to_cmyk = None
-_cmyk_to_rgb = None
+# 同一进程内不同批次可选不同 CMYK ICC：按路径缓存变换，按线程记录当前 ICC
+_icc_cache = {}
+_icc_cache_lock = threading.Lock()
+_icc_local = threading.local()
 
 
-def _init_icc(cmyk_icc_path=_CMYK_ICC):
-    global _srgb_profile, _cmyk_profile, _rgb_to_cmyk, _cmyk_to_rgb
-    if _rgb_to_cmyk is not None:
-        return
-    if not os.path.exists(cmyk_icc_path):
-        raise FileNotFoundError(f"CMYK ICC 不存在: {cmyk_icc_path}")
-    _srgb_profile = ImageCms.createProfile("sRGB")
-    _cmyk_profile = ImageCms.getOpenProfile(cmyk_icc_path)
-    _rgb_to_cmyk = ImageCms.buildTransformFromOpenProfiles(
-        _srgb_profile, _cmyk_profile, "RGB", "CMYK", _INTENT, _FLAGS)
-    _cmyk_to_rgb = ImageCms.buildTransformFromOpenProfiles(
-        _cmyk_profile, _srgb_profile, "CMYK", "RGB", _INTENT, _FLAGS)
+class _IccTransforms:
+    __slots__ = ("path", "description", "rgb_to_cmyk", "cmyk_to_rgb", "data")
+
+    def __init__(self, path):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"CMYK ICC 不存在: {path}")
+        with open(path, "rb") as f:
+            self.data = f.read()
+        cmyk_profile = ImageCms.ImageCmsProfile(io.BytesIO(self.data))
+        space = (cmyk_profile.profile.xcolor_space or "").strip()
+        if space != "CMYK":
+            raise ValueError(f"ICC 不是 CMYK 输出特性文件（色彩空间: {space or '未知'}）")
+        srgb = ImageCms.createProfile("sRGB")
+        self.path = path
+        self.description = (ImageCms.getProfileDescription(cmyk_profile) or "").strip()
+        self.rgb_to_cmyk = ImageCms.buildTransformFromOpenProfiles(
+            srgb, cmyk_profile, "RGB", "CMYK", _INTENT, _FLAGS)
+        self.cmyk_to_rgb = ImageCms.buildTransformFromOpenProfiles(
+            cmyk_profile, srgb, "CMYK", "RGB", _INTENT, _FLAGS)
+
+
+def load_icc_transforms(cmyk_icc_path):
+    """加载（并缓存）某个 CMYK ICC 的正反向变换；ICC 无效时抛 ValueError。"""
+    key = os.path.abspath(str(cmyk_icc_path))
+    mtime = os.path.getmtime(key) if os.path.exists(key) else None
+    with _icc_cache_lock:
+        cached = _icc_cache.get(key)
+        if cached and cached[0] == mtime:
+            return cached[1]
+    transforms = _IccTransforms(key)
+    with _icc_cache_lock:
+        _icc_cache[key] = (mtime, transforms)
+    return transforms
+
+
+def current_cmyk_icc():
+    return getattr(_icc_local, "path", None) or _CMYK_ICC
+
+
+@contextmanager
+def use_cmyk_icc(cmyk_icc_path):
+    """在当前线程内切换 CMYK ICC：转换、软打样与输出文件内嵌的 ICC 都跟随它。"""
+    path = os.path.abspath(str(cmyk_icc_path or _CMYK_ICC))
+    load_icc_transforms(path)
+    previous = getattr(_icc_local, "path", None)
+    _icc_local.path = path
+    try:
+        yield path
+    finally:
+        _icc_local.path = previous
+
+
+def _init_icc():
+    return load_icc_transforms(current_cmyk_icc())
 
 
 def _read_rgb(path):
-    _init_icc()
+    icc = _init_icc()
     img = Image.open(path)
     if img.mode == "CMYK":
-        img = ImageCms.applyTransform(img, _cmyk_to_rgb)
+        img = ImageCms.applyTransform(img, icc.cmyk_to_rgb)
     else:
         img = img.convert("RGB")
     return np.array(img, dtype=np.float32) / 255.0
 
 
 def _to_cmyk_pil(rgb_pil):
-    _init_icc()
-    return ImageCms.applyTransform(rgb_pil, _rgb_to_cmyk)
+    return ImageCms.applyTransform(rgb_pil, _init_icc().rgb_to_cmyk)
 
 
 def _icc_bytes():
-    if os.path.exists(_CMYK_ICC):
-        with open(_CMYK_ICC, "rb") as f:
-            return f.read()
-    return None
+    try:
+        return _init_icc().data
+    except FileNotFoundError:
+        return None
 
 
 def cmyk_to_srgb(cmyk_pil):
     if cmyk_pil.mode != "CMYK":
         return cmyk_pil.convert("RGB")
-    _init_icc()
-    return ImageCms.applyTransform(cmyk_pil, _cmyk_to_rgb)
+    return ImageCms.applyTransform(cmyk_pil, _init_icc().cmyk_to_rgb)
 
 
 def save_cmyk_image(cmyk_pil, path, fmt=None, lossless=False):
@@ -756,8 +738,8 @@ def _apply_curve_content(img_np, model, gains=None):
     if isinstance(model, HybridPipeline):
         h, w = img_np.shape[:2]
         gains_kw = dict(
-            curve_gain=gains.get("curve", 1.2),
-            skin_gain=gains.get("skin", 1.2),
+            curve_gain=gains.get("curve", 1.0),
+            skin_gain=gains.get("skin", 1.0),
             residual_gain=gains.get("residual", 1.0),
         )
         if h * w > TILE_TRIGGER_PIXELS:
@@ -1008,10 +990,9 @@ def iter_source_pages(path, dpi=None):
     if is_pdf(path):
         yield from iter_pdf_pages(path, dpi=dpi)
         return
-    _init_icc()
     with Image.open(path) as img:
         img.load()
-        rgb = ImageCms.applyTransform(img, _cmyk_to_rgb) if img.mode == "CMYK" else img.convert("RGB")
+        rgb = cmyk_to_srgb(img) if img.mode == "CMYK" else img.convert("RGB")
         info_dpi = img.info.get("dpi")
     page_dpi = float(dpi or PDF_DPI)
     try:
@@ -1105,6 +1086,9 @@ def _require_pypdf():
         import pypdf  # noqa: F401
     except ImportError as exc:
         raise ValueError("未安装 pypdf，无法保留 PDF 分层。请执行 pip install pypdf") from exc
+    _raise_pypdf_limits()
+
+
 class _SimpleImageRef:
     """轻量 image 适配器，只暴露 pypdf image 对象里我们用到的接口。
     ★ 关键：不触发 pypdf 的解码和 MAX_IMAGE_BUFFER_SIZE 检查。
@@ -1218,46 +1202,10 @@ def _collect_writer_images(writer):
                 continue
     print(f"   [PDF] 扫描 {total_pages} 页，找到 {len(images)} 张嵌入图")
     return images
-_icc_transform_cache = {}
 
-
-def _pil_cmyk_to_srgb_with_icc(cmyk_pil, icc_bytes):
-    """
-    ★ 用图像自带的 ICC profile 把 CMYK 转 sRGB。
-    - icc_bytes 为 None / 无效 → 回退到 PSOcoated（老行为）。
-    - 转失败 → 回退。
-    """
-    if not icc_bytes:
-        return _pil_to_model_rgb(cmyk_pil)
-
-    key = len(icc_bytes) * 31 + hash(icc_bytes[:256])
-    transform = _icc_transform_cache.get(key)
-    if transform is None:
-        try:
-            src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
-            srgb_profile = ImageCms.createProfile("sRGB")
-            transform = ImageCms.buildTransformFromOpenProfiles(
-                src_profile, srgb_profile, "CMYK", "RGB", _INTENT, _FLAGS)
-            _icc_transform_cache[key] = transform
-            try:
-                desc = ImageCms.getProfileDescription(src_profile).strip()
-            except Exception:
-                desc = "?"
-            print(f"   [ICC] 使用嵌入 profile: {desc!r}")
-        except Exception as exc:
-            print(f"   [ICC] 解析失败({exc})，回退 PSOcoated")
-            return _pil_to_model_rgb(cmyk_pil)
-
-    try:
-        rgb = ImageCms.applyTransform(cmyk_pil, transform)
-        return np.asarray(rgb, dtype=np.float32) / 255.0
-    except Exception as exc:
-        print(f"   [ICC] 转换失败({exc})，回退 PSOcoated")
-        return _pil_to_model_rgb(cmyk_pil)
 def _pil_to_model_rgb(pil):
-    _init_icc()
     if pil.mode == "CMYK":
-        rgb = ImageCms.applyTransform(pil, _cmyk_to_rgb)
+        rgb = cmyk_to_srgb(pil)
     else:
         rgb = pil.convert("RGB")
     return np.asarray(rgb, dtype=np.float32) / 255.0
@@ -1333,80 +1281,7 @@ def _read_embedded_image_raw(image):
         return Image.frombytes(mode, (w, h), raw[:expected])
     except Exception:
         return None
-def _read_embedded_image_with_icc(image):
-    """
-    ★ 从 XObject 读原始像素 + 嵌入的 ICC profile。
-    返回 (pil_image, icc_bytes)：
-        pil_image: PIL Image，mode 为 CMYK / RGB / L
-        icc_bytes: 嵌入图自带的 ICC profile 字节流（可能为 None）
-    只支持 8bit + 单一 FlateDecode；其余返回 (None, None)。
-    """
-    from pypdf.generic import IndirectObject
-    try:
-        obj = image.indirect_reference.get_object()
-        w = int(obj["/Width"])
-        h = int(obj["/Height"])
-        bpc = int(obj.get("/BitsPerComponent", 8))
-        if bpc != 8:
-            return None, None
 
-        cs = obj.get("/ColorSpace")
-        cs = cs.get_object() if isinstance(cs, IndirectObject) else cs
-        n_channels, mode = 0, None
-        icc_bytes = None
-
-        if isinstance(cs, list) and str(cs[0]) == "/ICCBased":
-            icc_obj = cs[1].get_object() if isinstance(cs[1], IndirectObject) else cs[1]
-            n = int(icc_obj.get("/N", 0))
-            if n == 4:
-                n_channels, mode = 4, "CMYK"
-            elif n == 3:
-                n_channels, mode = 3, "RGB"
-            elif n == 1:
-                n_channels, mode = 1, "L"
-            else:
-                return None, None
-            try:
-                icc_bytes = bytes(icc_obj.get_data())
-            except Exception as exc:
-                print(f"   [ICC] ICC 流读取失败: {exc}")
-                icc_bytes = None
-        elif isinstance(cs, str) or not isinstance(cs, list):
-            cs_str = str(cs)
-            if cs_str == "/DeviceCMYK":
-                n_channels, mode = 4, "CMYK"
-            elif cs_str == "/DeviceRGB":
-                n_channels, mode = 3, "RGB"
-            elif cs_str == "/DeviceGray":
-                n_channels, mode = 1, "L"
-            else:
-                return None, None
-        else:
-            return None, None
-
-        filt = obj.get("/Filter")
-        filt = filt.get_object() if isinstance(filt, IndirectObject) else filt
-        if isinstance(filt, list):
-            if [str(f) for f in filt] != ["/FlateDecode"]:
-                return None, None
-        elif str(filt) not in ("/FlateDecode", "FlateDecode"):
-            return None, None
-
-        raw = _raw_stream_bytes(obj)
-        if raw is None:
-            return None, None
-        try:
-            raw = zlib.decompress(raw)
-        except Exception:
-            return None, None
-
-        expected = w * h * n_channels
-        if len(raw) < expected:
-            return None, None
-        return Image.frombytes(mode, (w, h), raw[:expected]), icc_bytes
-    except Exception as exc:
-        print(f"   [ICC] 读嵌入图失败: {exc}")
-        return None, None
 
 # 向后兼容：老的曲线调整路径仍在调用 _read_embedded_cmyk
 def _read_embedded_cmyk(image):
@@ -1485,11 +1360,10 @@ def _write_pypdf_cmyk_image(image_file, cmyk_pil):
     new.indirect_reference = ref
     pdf._objects[ref.idnum - 1] = new
 
+
 def process_pdf_keep_structure(src, dest, model=None, curves=None, gains=None,
                                raw_cmyk=False):
-    """复制输入 PDF 对象树，只替换嵌入图像素。
-    ★ 首次处理阶段（model != None）会用嵌入图自带 ICC 转 sRGB。
-    """
+    """复制输入 PDF 对象树，只替换嵌入图像素。"""
     _require_pypdf()
     from pypdf import PdfWriter
 
@@ -1505,6 +1379,7 @@ def process_pdf_keep_structure(src, dest, model=None, curves=None, gains=None,
     try:
         images = _collect_writer_images(writer)
         if not images:
+            # 没有图像可处理，直接原样复制并返回 0（上层不会当成失败）
             writer.write(dest)
             _restore_pdf_private_tail(src, dest)
             print("   PDF 无嵌入位图，原样保留分层结构")
@@ -1513,73 +1388,51 @@ def process_pdf_keep_structure(src, dest, model=None, curves=None, gains=None,
         count = 0
         for image in images:
             cmyk = None
-            raw_pil = None
             try:
-                # ============ 曲线阶段：直接对 CMYK 数值套 LUT ============
-                if raw_cmyk:
-                    cmyk = _read_embedded_cmyk(image)
-                    if cmyk is not None and not identity_curves:
-                        cmyk = apply_cmyk_curves(cmyk, curves, content_only=False)
-                    if cmyk is None:
-                        print("   跳过：曲线阶段只处理 8bit FlateDecode CMYK 图像")
-                        continue
-
-                # ============ 首次处理：用嵌入 ICC 转 RGB → 模型 → CMYK ============
-                else:
-                    raw_pil, icc_bytes = _read_embedded_image_with_icc(image)
-                    if raw_pil is not None:
-                        if raw_pil.mode == "CMYK":
-                            # ★ 关键修复：优先用图像自带 ICC
-                            rgb = _pil_cmyk_to_srgb_with_icc(raw_pil, icc_bytes)
+                # ★ 首选：绕过 pypdf 的解码器，直接读原始字节
+                raw_pil = _read_embedded_image_raw(image)
+                if raw_pil is not None:
+                    if raw_pil.mode == "CMYK":
+                        cmyk = raw_pil
+                        if not identity_curves:
+                            cmyk = apply_cmyk_curves(cmyk, curves, content_only=False)
+                    elif raw_pil.mode in ("RGB", "L"):
+                        if raw_pil.mode == "L":
+                            rgb_pil = raw_pil.convert("RGB")
                             raw_pil.close()
-                            raw_pil = None
-                        elif raw_pil.mode == "RGB":
-                            # 已经 RGB 的嵌入图，不涉及 CMYK ICC
-                            rgb = np.asarray(raw_pil.convert("RGB"),
-                                             dtype=np.float32) / 255.0
-                            raw_pil.close()
-                            raw_pil = None
-                        elif raw_pil.mode == "L":
-                            rgb = np.asarray(raw_pil.convert("RGB"),
-                                             dtype=np.float32) / 255.0
-                            raw_pil.close()
-                            raw_pil = None
+                            raw_pil = rgb_pil
+                        if model is not None:
+                            rgb_np = np.asarray(raw_pil, dtype=np.float32) / 255.0
+                            rgb_np, _ = _apply_curve_content(rgb_np, model, gains=gains)
+                            rgb_final = Image.fromarray(
+                                (np.clip(rgb_np, 0, 1) * 255).astype(np.uint8), "RGB")
+                            cmyk = _to_cmyk_pil(rgb_final)
+                            rgb_final.close()
                         else:
-                            rgb = _pil_to_model_rgb(raw_pil)
-                            raw_pil.close()
-                            raw_pil = None
-
-                        # 过模型
-                        if model is not None:
-                            rgb, _ = _apply_curve_content(rgb, model, gains=gains)
-
-                        # sRGB → PSOcoated CMYK（统一交付）
-                        cmyk = _to_cmyk_pil(Image.fromarray(
-                            (np.clip(rgb, 0, 1) * 255).astype(np.uint8), "RGB"))
-                        if not identity_curves:
-                            cmyk = apply_cmyk_curves(cmyk, curves, content_only=False)
-                    else:
-                        # 兜底：交给 pypdf（可能失败）
-                        try:
-                            pil = image.image
-                        except Exception as exc:
-                            print(f"   跳过无法解码的嵌入图: {exc}")
-                            continue
-                        if pil is None:
-                            print("   跳过 image.image 返回 None 的嵌入图")
-                            continue
-                        rgb = _pil_to_model_rgb(pil)
-                        if model is not None:
-                            rgb, _ = _apply_curve_content(rgb, model, gains=gains)
-                        cmyk = _to_cmyk_pil(Image.fromarray(
-                            (np.clip(rgb, 0, 1) * 255).astype(np.uint8), "RGB"))
+                            cmyk = _to_cmyk_pil(raw_pil)
+                        raw_pil.close()
                         if not identity_curves:
                             cmyk = apply_cmyk_curves(cmyk, curves, content_only=False)
 
+                # 次选：让 pypdf 解码（已提升限制，可能仍失败）
                 if cmyk is None:
-                    continue
+                    try:
+                        pil = image.image
+                    except Exception as exc:
+                        print(f"   跳过无法解码的嵌入图: {exc}")
+                        continue
+                    if pil is None:
+                        print("   跳过 image.image 返回 None 的嵌入图")
+                        continue
+                    rgb = _pil_to_model_rgb(pil)
+                    if model is not None:
+                        rgb, _ = _apply_curve_content(rgb, model, gains=gains)
+                    cmyk = _to_cmyk_pil(
+                        Image.fromarray((np.clip(rgb, 0, 1) * 255).astype(np.uint8), "RGB"))
+                    if not identity_curves:
+                        cmyk = apply_cmyk_curves(cmyk, curves, content_only=False)
 
-                # ============ 写回 ============
+                # 尺寸对齐 + 写回
                 orig = image.indirect_reference.get_object()
                 orig_w, orig_h = int(orig["/Width"]), int(orig["/Height"])
                 if cmyk.size != (orig_w, orig_h):
@@ -1596,12 +1449,8 @@ def process_pdf_keep_structure(src, dest, model=None, curves=None, gains=None,
                         cmyk.close()
                 except Exception:
                     pass
-                try:
-                    if raw_pil is not None:
-                        raw_pil.close()
-                except Exception:
-                    pass
 
+        # ★ 关键：一张图都没成功，抛异常触发栅格化降级
         if count == 0:
             raise RuntimeError(
                 f"分层路径未处理任何嵌入图（共发现 {len(images)} 张）")
@@ -1686,41 +1535,19 @@ def _rasterize_pdf_with_curves(src_pdf, dest_pdf, curves, dpi=None):
 
 
 def apply_cmyk_curves_to_pdf(src, dest, curves):
-    """
-    曲线调整：优先分层路径（保留矢量/文字），失败则回退整页栅格化。
-    ★ 明确返回生成的文件路径，并在每一步打印诊断日志。
-    """
+    """在保留分层的 PDF 上套手工 CMYK 曲线。失败时抛出，由上层用整页 TIFF 重组。"""
     src, dest = str(src), str(dest)
     print(f"   [曲线调整] 开始: {Path(src).name} → {Path(dest).name}")
-
-    # ★ 删除旧文件，避免"文件已存在"造成误判
     try:
         if os.path.exists(dest):
             os.remove(dest)
     except Exception:
         pass
-
-    try:
-        result = process_pdf_keep_structure(src, dest, model=None,
-                                            curves=curves, raw_cmyk=True)
-        # 分层路径成功，验证文件
-        if not os.path.exists(dest) or os.path.getsize(dest) == 0:
-            raise RuntimeError(f"分层路径未生成有效文件: {dest}")
-        print(f"   [曲线调整] ✅ 分层完成 ({os.path.getsize(dest)} bytes)")
-        return dest
-    except Exception as exc:
-        print(f"   [曲线调整] 分层失败({type(exc).__name__}: {exc})，回退整页栅格化")
-        traceback.print_exc()
-
-    # Fallback: 整页栅格化
-    try:
-        result = _rasterize_pdf_with_curves(src, dest, curves)
-        print(f"   [曲线调整] ✅ 栅格化完成 ({os.path.getsize(result)} bytes)")
-        return result
-    except Exception as exc:
-        print(f"   [曲线调整] ❌ 栅格化也失败: {exc}")
-        traceback.print_exc()
-        raise RuntimeError(f"PDF 曲线调整彻底失败: {exc}") from exc
+    process_pdf_keep_structure(src, dest, model=None, curves=curves, raw_cmyk=True)
+    if not os.path.exists(dest) or os.path.getsize(dest) == 0:
+        raise RuntimeError(f"分层路径未生成有效文件: {dest}")
+    print(f"   [曲线调整] ✅ 分层完成 ({os.path.getsize(dest)} bytes)")
+    return dest
 
 
 # ============================================================
@@ -1734,7 +1561,7 @@ def save_processed_image(pred_pil, path, as_cmyk=True):
     return path
 
 
-def pil_to_bytes(pil_img, fmt="JPEG", quality=95):
+def _pil_to_bytes(pil_img, fmt="JPEG", quality=95):
     buf = io.BytesIO()
     fmt_upper = fmt.upper()
     if fmt_upper == "JPEG":
@@ -1978,7 +1805,7 @@ def process_image_pair(image_path, target_path=None, model=None,
             cmyk = _to_cmyk_pil(pred_pil)
             name = cmyk_container_name(output_filename or Path(image_path).name)
             fmt = format_from_suffix(Path(name).suffix)
-            raw, mime = pil_to_bytes(cmyk, fmt=fmt)
+            raw, mime = _pil_to_bytes(cmyk, fmt=fmt)
             return {"rgb": {"bytes": raw, "mime": mime, "filename": name}}
         finally:
             pred_pil.close()

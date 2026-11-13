@@ -1,12 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-统一数据加载（优化版 v3）：
+统一数据加载：
 - PrintDataset: CMYK 4通道（阶段1）
-- RGBPairDataset: RGB 输入 + ICC 转换 sRGB 目标（阶段2）
-- RGBSkinDataset: RGB + person/face mask（阶段3 肤色调整，带 npy 缓存）
-
-【修补】
-- RGBSkinDataset：mask 现在与图像执行相同的中心裁剪 + resize，避免拉伸错位
+- RGBPairDataset + discover_pairs + make_rgb_split: RGB 输入 + ICC 转换 sRGB 目标（阶段2）
 """
 import os
 import re
@@ -62,28 +58,6 @@ def _resize(arr, size, mode):
     pil = Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8), mode)
     pil = center_crop_square(pil).resize((size, size), Image.BILINEAR)
     return np.array(pil, dtype=np.float32) / 255.0
-
-
-def _preprocess_image(path, is_target, img_size, cmyk_to_rgb_transform):
-    """加载并预处理单张图：转RGB + 中心裁剪 + resize，返回 float32 [0,1]"""
-    img = Image.open(path)
-    if is_target and img.mode == "CMYK":
-        if cmyk_to_rgb_transform is None:
-            img = img.convert("RGB")
-        else:
-            img = ImageCms.applyTransform(img, cmyk_to_rgb_transform)
-    else:
-        img = img.convert("RGB")
-
-    arr = np.array(img, dtype=np.float32) / 255.0
-    if arr.shape[0] != img_size or arr.shape[1] != img_size:
-        pil = Image.fromarray((arr * 255).astype(np.uint8), "RGB")
-        w, h = pil.size
-        s = min(w, h)
-        left, top = (w - s) // 2, (h - s) // 2
-        pil = pil.crop((left, top, left + s, top + s))
-        arr = np.array(pil.resize((img_size, img_size)), dtype=np.float32) / 255.0
-    return arr.astype(np.float32)
 
 
 # ==================== PrintDataset（阶段1，保持原样） ====================
@@ -258,7 +232,23 @@ class RGBPairDataset(Dataset):
             if os.path.exists(cpath):
                 return np.load(cpath).astype(np.float32)
 
-        arr = _preprocess_image(path, is_target, self.img_size, self._cmyk_to_rgb)
+        img = Image.open(path)
+        if is_target and img.mode == "CMYK":
+            if self._cmyk_to_rgb is None:
+                img = img.convert("RGB")
+            else:
+                img = ImageCms.applyTransform(img, self._cmyk_to_rgb)
+        else:
+            img = img.convert("RGB")
+
+        arr = np.array(img, dtype=np.float32) / 255.0
+        if arr.shape[0] != self.img_size or arr.shape[1] != self.img_size:
+            pil = Image.fromarray((arr * 255).astype(np.uint8))
+            w, h = pil.size
+            s = min(w, h)
+            left, top = (w - s) // 2, (h - s) // 2
+            pil = pil.crop((left, top, left + s, top + s))
+            arr = np.array(pil.resize((self.img_size, self.img_size)), dtype=np.float32) / 255.0
 
         if cpath:
             os.makedirs(self.cache_dir, exist_ok=True)
@@ -275,189 +265,6 @@ class RGBPairDataset(Dataset):
         return {
             "input":  torch.from_numpy(inp).permute(2, 0, 1).float(),
             "target": torch.from_numpy(tgt).permute(2, 0, 1).float(),
-        }
-
-
-# ==================== 肤色调整 Dataset（阶段3，带 npy 缓存） ====================
-
-def _resize_mask(mask, img_size):
-    """mask (H,W) float32 -> resize 到 (img_size, img_size)"""
-    if mask.shape[0] == img_size and mask.shape[1] == img_size:
-        return mask
-    pil = Image.fromarray((np.clip(mask, 0, 1) * 255).astype(np.uint8), "L")
-    return np.array(pil.resize((img_size, img_size), Image.BILINEAR), dtype=np.float32) / 255.0
-
-
-def _center_crop_mask(mask, img_size):
-    """
-    【新增】对 mask 执行与图像相同的中心正方形裁剪，再 resize。
-    避免原图非方形时 mask 被拉伸、与图像内容错位。
-    mask: (H,W) 或 (H,W,...) ndarray
-    返回: (img_size, img_size) float32
-    """
-    pil = Image.fromarray((np.clip(mask, 0, 1) * 255).astype(np.uint8), "L")
-    w, h = pil.size
-    s = min(w, h)
-    if w > h:
-        left = (w - h) // 2
-        pil = pil.crop((left, 0, left + h, h))
-    else:
-        top = (h - w) // 2
-        pil = pil.crop((0, top, w, top + w))
-    return np.array(pil.resize((img_size, img_size), Image.BILINEAR), dtype=np.float32) / 255.0
-
-
-class RGBSkinDataset(Dataset):
-    """
-    输入: RGB(input) + target(RGB, 由CMYK经ICC转来)
-    附加: person_mask, face_mask (来自 mask_cache)
-    支持 npy 缓存：首次读取时保存 {stem}_cache.npz，后续直接读取加速
-
-    缓存文件命名规则（避免与 mask 目录混淆）：
-        {cache_dir}/{stem}_size{img_size}.npz  含 input/target/person/face
-    """
-
-    def __init__(self, pairs, mask_dir, cache_dir=None, img_size=512):
-        self.pairs = pairs
-        self.mask_dir = mask_dir
-        self.cache_dir = cache_dir
-        self.img_size = img_size
-
-        cmyk_icc_path = os.path.join("utils", "PSOcoated_v3.icc")
-        if os.path.exists(cmyk_icc_path):
-            cmyk_profile = ImageCms.getOpenProfile(cmyk_icc_path)
-            srgb_profile = ImageCms.createProfile("sRGB")
-            self._cmyk_to_rgb = ImageCms.buildTransformFromOpenProfiles(
-                cmyk_profile, srgb_profile, "CMYK", "RGB",
-                renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC,
-                flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
-            )
-        else:
-            print("⚠ 未找到 PSOcoated_v3.icc，target 按普通 RGB 读取")
-            self._cmyk_to_rgb = None
-
-        # 预检查 mask 文件是否齐全
-        missing = []
-        for inp_p, _ in self.pairs[:5]:  # 只抽查前5个
-            stem = os.path.splitext(os.path.basename(inp_p))[0].replace("_input", "")
-            p = os.path.join(mask_dir, f"{stem}_person.npy")
-            f = os.path.join(mask_dir, f"{stem}_face.npy")
-            if not os.path.exists(p) or not os.path.exists(f):
-                missing.append(stem)
-        if missing:
-            print(f"⚠ mask 缺失示例: {missing[:3]} ... 请先运行 generate_masks.py")
-
-    def _cache_path(self, stem):
-        """返回该 stem 对应的缓存文件路径"""
-        if not self.cache_dir:
-            return None
-        return os.path.join(self.cache_dir, f"{stem}_size{self.img_size}.npz")
-
-    @staticmethod
-    def _compute_skin_face(face_mask, rgb_arr):
-        """YuNet人脸 ∩ YCrCb肤色检测，返回 0/1 mask"""
-        import cv2
-        img = (np.clip(rgb_arr, 0, 1) * 255).astype(np.uint8)
-        ycrcb = cv2.cvtColor(img, cv2.COLOR_RGB2YCrCb)
-        skin = ((ycrcb[..., 1] >= 133) & (ycrcb[..., 1] <= 173) &
-                (ycrcb[..., 2] >= 77)  & (ycrcb[..., 2] <= 127)).astype(np.float32)
-        skin_face = skin * face_mask
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        skin_face = cv2.morphologyEx(skin_face, cv2.MORPH_OPEN, kernel)
-        return skin_face
-    @staticmethod
-    def _compute_skin_broad(rgb_arr):
-        r = rgb_arr[..., 0]
-        g = rgb_arr[..., 1]
-        b = rgb_arr[..., 2]
-        mx = np.max(rgb_arr, axis=-1)
-        mn = np.min(rgb_arr, axis=-1)
-        denom = np.maximum(mx, 1e-6)              # ★ 改为 maximum 而不是 +eps
-        sat = (mx - mn) / denom
-        sat = np.nan_to_num(sat, nan=0.0, posinf=1.0, neginf=0.0)   # ★ 处理 NaN/Inf
-        mask = (r > 0.35) & (g > 0.15) & (b > 0.05) & (r > g) & (g > b) & (sat > 0.15)
-        return mask.astype(np.float32)
-
-    def _load_cached_or_build(self, stem, inp_p, tgt_p):
-        """
-        首次加载：处理 input/target/person/face/skin_face/skin_broad 并保存 npz 缓存
-        后续加载：直接读取 npz（老缓存缺 skin_broad 会补算并回写）
-        返回: (input, target, person, face, skin_face, skin_broad)
-        """
-        cpath = self._cache_path(stem)
-
-        # ---------- 命中缓存 ----------
-        if cpath and os.path.exists(cpath):
-            data = np.load(cpath)
-            inp = data["input"]
-            tgt = data["target"]
-            person = data["person"]
-            face = data["face"]
-
-            if "skin_face" in data:
-                skin_face = data["skin_face"]
-            else:
-                skin_face = self._compute_skin_face(face, inp).astype(np.float16)
-
-            # ★ 新增：老缓存缺 skin_broad 时实时计算
-            if "skin_broad" in data:
-                skin_broad = data["skin_broad"]
-            else:
-                skin_broad = self._compute_skin_broad(inp).astype(np.float16)
-                # 回写升级
-                np.savez_compressed(
-                    cpath,
-                    input=data["input"], target=data["target"],
-                    person=data["person"], face=data["face"],
-                    skin_face=skin_face, skin_broad=skin_broad,
-                )
-            return inp, tgt, person, face, skin_face, skin_broad
-
-        # ---------- 未命中：从头构建 ----------
-        inp = _preprocess_image(inp_p, is_target=False, img_size=self.img_size,
-                                cmyk_to_rgb_transform=self._cmyk_to_rgb)
-        tgt = _preprocess_image(tgt_p, is_target=True, img_size=self.img_size,
-                                cmyk_to_rgb_transform=self._cmyk_to_rgb)
-
-        person = np.load(os.path.join(self.mask_dir, f"{stem}_person.npy")).astype(np.float32)
-        face = np.load(os.path.join(self.mask_dir, f"{stem}_face.npy")).astype(np.float32)
-        person = _center_crop_mask(person, self.img_size)
-        face = _center_crop_mask(face, self.img_size)
-
-        skin_face = _center_crop_mask(self._compute_skin_face(face, inp), self.img_size)
-        # ★ 新增：宽色彩 mask
-        skin_broad = self._compute_skin_broad(inp)
-
-        if cpath:
-            os.makedirs(self.cache_dir, exist_ok=True)
-            np.savez_compressed(
-                cpath,
-                input=inp.astype(np.float16),
-                target=tgt.astype(np.float16),
-                person=person.astype(np.float16),
-                face=face.astype(np.float16),
-                skin_face=skin_face.astype(np.float16),
-                skin_broad=skin_broad.astype(np.float16),
-            )
-        return inp, tgt, person, face, skin_face, skin_broad
-
-    def __len__(self):
-        return len(self.pairs)
-
-    def __getitem__(self, idx):
-        inp_p, tgt_p = self.pairs[idx]
-        stem = os.path.splitext(os.path.basename(inp_p))[0].replace("_input", "")
-
-        inp, tgt, person, face, skin_face, skin_broad = \
-            self._load_cached_or_build(stem, inp_p, tgt_p)
-
-        return {
-            "input":       torch.from_numpy(inp).permute(2, 0, 1).float(),
-            "target":      torch.from_numpy(tgt).permute(2, 0, 1).float(),
-            "person_mask": torch.from_numpy(person).unsqueeze(0).float(),
-            "face_mask":   torch.from_numpy(face).unsqueeze(0).float(),
-            "skin_face":   torch.from_numpy(skin_face).unsqueeze(0).float(),
-            "skin_broad":  torch.from_numpy(skin_broad).unsqueeze(0).float(),  # ★ 新增
         }
 
 
